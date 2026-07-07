@@ -6483,16 +6483,20 @@ async function searchWithEngine(brand, tabTimeout, engine) {
 // Now: consistent scoring across DDG, Yahoo, Mojeek, Brave, SearXNG, Bing.
 // Fix #13: position-0 (rank-1) results receive a +2 confidence bonus across all tiers
 // since rank-1 in search results is inherently more likely to be the target domain.
-// Tier breakdown (conf %):
-//   76 — strict domain match, rank 1, not a known duplicate  (+2 bonus)
-//   74 — strict domain match, not a known duplicate
-//   68 — strict domain match (duplicate, but still usable)
-//   60 — high resemblance (≥50% LCS), rank 1, non-duplicate (+2 bonus)
-//   58 — high resemblance (≥50% LCS), not a known duplicate
-//   52 — high resemblance (≥50% LCS), any
-//   48 — any non-blacklisted, rank 1, non-duplicate (+2 bonus)
-//   46 — any non-blacklisted, non-duplicate
-//   40 — absolute last resort
+// v7.1.50: tier breakdown reconciled against the actual code below (this
+// comment previously documented an older 76/74/68/60/58/52/48/46/40 ladder
+// with a ≥50% LCS cutoff — stale relative to the tiers actually returned).
+// Base conf %, scanned over `cands` (top 8) for T1/T2 or `top5` for T3-T6.
+// Every tier gets +2 if the candidate is the rank-1 (position-0) result.
+//   T1  74 — strict domain match (domainMatchesBrand), not a known duplicate
+//   T2  68 — strict domain match, even if flagged as a duplicate
+//   T3  62 — brand-domain resemblance ≥40% LCS, not a known duplicate
+//   T4  56 — brand-domain resemblance ≥40% LCS, any (duplicate or not)
+//   T5  50 — brand-domain resemblance ≥35% LCS, not a known duplicate
+//   T6  44 — brand-domain resemblance ≥35% LCS, any — ONLY when the current
+//            run mode has `verify: true` (MODES[ST.mode].verify); skipped
+//            entirely in fast/balanced modes so an unverified weak guess can
+//            never become a false "found" website.
 function pickSearchCandidate(hits, brand, engine) {
   const label = searchEngineLabel(engine);
   const clean = (hits || []).filter(u => !isBlacklisted(u));
