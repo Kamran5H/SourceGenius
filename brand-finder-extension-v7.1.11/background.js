@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// Source Genius — background.js  v7.0.27  (Service Worker)
+// Source Genius — background.js  v7.1.49  (Service Worker)
+// Authoritative version lives in manifest.json; keep this banner in sync with it.
 // © Developed by Source Genius
 // ═══════════════════════════════════════════════════════════════
 // Versions v2.0–v4.0 preserved unchanged.

@@ -122,14 +122,13 @@ not a reimplementation.
   (`stealth.js`, the CAPTCHA-handling paths in `background.js`) is intentionally
   out of scope for further hardening in this codebase — see the code comments
   where it's used.
-- **Version numbers are currently inconsistent** across this codebase:
-  `manifest.json` says `7.1.49`, the `background.js`/`sidepanel.js` file
-  header comments still say `v7.0.27`, the sidepanel's user-facing badge says
-  `v7.1.29`, and the folder itself is named `v7.1.11`. None of this affects
-  runtime behavior, but it means the version string alone can't tell you what
-  code is actually running — check the manifest for the real version if in
-  doubt. Reconciling these to a single source of truth is a known follow-up,
-  not yet done.
+- **`manifest.json` is the single source of truth for the version** (currently
+  `7.1.49`). The `background.js`/`sidepanel.js` header banners and the
+  sidepanel's user-facing version strings are kept in sync with it; the inline
+  `// v7.1.x:` changelog annotations throughout the code are historical
+  "added-in" markers, not the current version. Note the folder is still named
+  `v7.1.11` — a stale directory name, harmless, left as-is to avoid breaking
+  any absolute paths that reference it.
 - **The shared backend (`emailcampaign.ai`) is hardcoded** in both
   `background.js` and `sidepanel.js`. This is by design (v7.1.2 — no
   per-user Google Apps Script setup needed) and out of scope to change here;

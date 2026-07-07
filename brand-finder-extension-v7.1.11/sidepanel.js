@@ -1,5 +1,6 @@
 // ═══════════════════════════════════════════════════════════════
-// Source Genius — sidepanel.js  v7.0.27
+// Source Genius — sidepanel.js  v7.1.49
+// Authoritative version lives in manifest.json; keep this banner in sync with it.
 // © Developed by Source Genius · sourcegenius.io
 // ═══════════════════════════════════════════════════════════════
 // v2.0 + v3.0 core preserved unchanged.
