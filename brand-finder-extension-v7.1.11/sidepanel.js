@@ -1294,6 +1294,7 @@ function statusBadge(s) {
     found:['bf','✅ Found'], 'not-found':['bn','⏭ No site'],
     error:['be','❌ Error'], skipped:['bk','⏩ Skip'],
     duplicate:['bd','🔁 Dupe'], 'db-duplicate':['bdb','🗄 DB Dupe'],
+    'needs-review':['bnr','🔍 Review'],
     pending:['bk','⏳'],
   };
   const [c,l] = m[s] || ['bk', s];

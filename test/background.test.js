@@ -156,3 +156,21 @@ test('validateResult: rejects a non-numeric confidence', () => {
   assert.equal(v.valid, false);
   assert.match(v.reason, /non-numeric confidence/);
 });
+
+test('validateResult: rejects an empty brand', () => {
+  const res = { url: 'https://www.amazon.com/dp/B0C1D2E3F4', brand: '   ', website: 'https://acme.com', conf: 74 };
+  const v = validateResult(res);
+  assert.equal(v.valid, false);
+  assert.match(v.reason, /empty brand/);
+});
+
+test('validateResult: accepts a lowercase page-scanned ASIN (normalized, not quarantined)', () => {
+  const res = { asin: 'b0c1d2e3f4', url: '', brand: 'Acme', website: 'https://acme.com', conf: 74 };
+  assert.deepEqual(validateResult(res), { valid: true });
+});
+
+test('validateResult: a record with no website is not rejected on URL grounds', () => {
+  // not-found records (no website) shouldn't fail validation just for lacking one
+  const res = { url: 'https://www.amazon.com/dp/B0C1D2E3F4', brand: 'Acme', website: '', conf: 0 };
+  assert.deepEqual(validateResult(res), { valid: true });
+});

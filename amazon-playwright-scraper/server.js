@@ -380,8 +380,9 @@ app.post('/scrape', async (req, res) => {
   // ?wait=1 — old blocking behavior, kept for any existing caller/tooling that
   // expects the full result set in the HTTP response.
   if (req.query.wait === '1') {
-    const final = await jobPromise;
-    return res.json({ success: true, jobId, count: final.length, file: filename, folder: jobFolder, results: final });
+    const final = await jobPromise; // runScrapeJob catches its own errors and always resolves
+    const jobErr = jobs.get(jobId)?.progress?.error;
+    return res.json({ success: !jobErr, jobId, count: final.length, file: filename, folder: jobFolder, results: final, ...(jobErr ? { error: jobErr } : {}) });
   }
 
   // Default: non-blocking. The job runs in the background; the client polls
@@ -401,7 +402,9 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
 
   jobLog(jobId, `Starting scrape for ${cleanKeywords.length} keywords${PROXIES.length ? ` (${PROXIES.length} proxies configured)` : ' (no proxy)'}`);
 
-  let browser = await chromium.launch({ headless: HEADLESS });
+  // Assigned inside the try below so a launch failure is caught and the job is
+  // still marked done in the finally — otherwise a poller waits on it forever.
+  let browser = null;
 
   // Helper: open one context+page, scrape kw, close context
   async function runKeyword(kw) {
@@ -433,7 +436,10 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
     }
   }
 
+  let final = [];
   try {
+    browser = await chromium.launch({ headless: HEADLESS });
+
     for (let i = 0; i < cleanKeywords.length && !job.stopRequested; i += CONCURRENCY) {
       const chunk = cleanKeywords.slice(i, i + CONCURRENCY);
 
@@ -499,18 +505,26 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
     }
   } catch (err) {
     jobLog(jobId, `⚠️ Fatal: ${err.message}`);
+    if (job) job.progress.error = err.message;
   } finally {
-    await browser.close().catch(() => {});
+    if (browser) await browser.close().catch(() => {});
+    // Final save runs exactly once here in EVERY path — normal completion, a
+    // mid-loop crash, or a launch failure — so whatever was collected is always
+    // persisted (incremental per-batch saves already cover most of it).
+    final = Array.from(allASINs.values());
+    try {
+      const saveResult = await saveCSV(final, filename, jobFolder);
+      jobLog(jobId, `✅ Done — ${saveResult.validCount} unique ASINs saved to ${jobFolder}\\${filename}`);
+      if (saveResult.needsReviewCount) {
+        jobLog(jobId, `⚠️ ${saveResult.needsReviewCount} row(s) failed validation — see ${filename.replace(/\.csv$/i, '')}.needs_review.csv`);
+      }
+    } catch (saveErr) {
+      jobLog(jobId, `⚠️ Final CSV save failed: ${saveErr.message}`);
+      if (job && !job.progress.error) job.progress.error = saveErr.message;
+    }
+    if (job) job.progress.done = true; // always resolve the job so pollers don't hang
   }
 
-  const final = Array.from(allASINs.values());
-  const saveResult = await saveCSV(final, filename, jobFolder);
-  jobLog(jobId, `✅ Done — ${saveResult.validCount} unique ASINs saved to ${jobFolder}\\${filename}`);
-  if (saveResult.needsReviewCount) {
-    jobLog(jobId, `⚠️ ${saveResult.needsReviewCount} row(s) failed validation — see ${filename.replace(/\.csv$/i, '')}.needs_review.csv`);
-  }
-
-  if (job) job.progress.done = true;
   return final;
 }
 

@@ -4077,8 +4077,10 @@ const JUNK_BRAND_NAMES = new Set([
 function validateResult(res) {
   const reasons = [];
 
-  const asin = res.asin || extractAsin(res.url || res.raw || '');
-  if (!asin || !/^[A-Z0-9]{10}$/.test(asin)) {
+  // Normalize before matching — a page-scanned ASIN can arrive lowercase, and
+  // a valid ASIN must never be quarantined over letter case.
+  const asin = String(res.asin || extractAsin(res.url || res.raw || '')).toUpperCase();
+  if (!/^[A-Z0-9]{10}$/.test(asin)) {
     reasons.push(`invalid ASIN "${asin || '(none)'}"`);
   }
 
