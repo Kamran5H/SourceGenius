@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>SG VPN Controller — Settings</title>
+  <style>
+    body { font: 14px/1.5 system-ui, Segoe UI, sans-serif; max-width: 720px; margin: 24px auto; padding: 0 16px; color: #1a1a2e; }
+    h1 { font-size: 18px; } h2 { font-size: 15px; margin-top: 24px; }
+    textarea { width: 100%; height: 140px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; padding: 8px; box-sizing: border-box; }
+    label { display: block; margin: 8px 0; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    button { padding: 7px 14px; border: 0; border-radius: 6px; background: #6366F1; color: #fff; cursor: pointer; font-size: 13px; }
+    button.secondary { background: #e5e7f0; color: #1a1a2e; }
+    .hint { color: #667; font-size: 12px; }
+    #status { margin-left: 8px; color: #16794b; font-weight: 600; }
+    code { background: #f1f1f7; padding: 1px 5px; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <h1>SG VPN Controller</h1>
+  <p class="hint">Auto-switches IP while Source Genius runs. Recommended backend is <b>Proxy</b> — deterministic, no clicking, no calibration.</p>
+
+  <h2>Backend</h2>
+  <label><input type="radio" name="backend" value="proxy" checked> <b>Proxy</b> (chrome.proxy — reliable, needs proxy endpoints below)</label>
+  <label><input type="radio" name="backend" value="urbanvpn"> <b>Urban VPN</b> (native-host clicker — fragile, needs calibration; see README)</label>
+  <label><input type="checkbox" id="enabled" checked> Controller enabled</label>
+
+  <h2>Proxies <span class="hint">(one per line, top = first used; rotates down the list on block/slow)</span></h2>
+  <textarea id="proxies" placeholder="http://user:pass@gate.smartproxy.com:7000&#10;http://user:pass@1.2.3.4:8080&#10;socks5://5.6.7.8:1080"></textarea>
+  <p class="hint">
+    Format: <code>scheme://[user:pass@]host:port</code>. Schemes: <code>http</code>, <code>https</code>, <code>socks5</code>.
+    Auth (<code>user:pass</code>) works for <b>http/https</b> proxies only — Chrome can't authenticate SOCKS from an extension.
+    A single <b>rotating residential</b> endpoint (one line) is best: it changes IP itself, so "rotate" just re-applies it.
+    Only <b>amazon.*</b> traffic is proxied; everything else stays direct.
+  </p>
+
+  <div class="row">
+    <button id="save">Save</button>
+    <span id="status"></span>
+  </div>
+
+  <h2>Test</h2>
+  <div class="row">
+    <button class="secondary" data-ev="block">Simulate block (connect)</button>
+    <button class="secondary" data-ev="slow">Simulate slow (rotate)</button>
+    <button class="secondary" data-ev="idle">Disconnect</button>
+  </div>
+  <p class="hint">After "connect", open <code>https://api.ipify.org</code> in a new tab — the IP should be the proxy's. After "Disconnect" it returns to your real IP.</p>
+
+  <script src="options.js"></script>
+</body>
+</html>
