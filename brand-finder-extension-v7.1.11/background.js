@@ -155,7 +155,18 @@ function sgBuildVersion() {
 // If the backend reports the build is locked, tell the panel to show the lock.
 function sgCheckLockResponse(j) {
   if (j && (j.error === 'EXTENSION_LOCKED' || j.locked === true)) {
-    try { chrome.runtime.sendMessage({ action: 'sgLocked', message: j.message, integrity: j.integrity }, () => { void chrome.runtime.lastError; }); } catch (_) {}
+    try {
+      chrome.runtime.sendMessage({ action: 'sgLocked', message: j.message, integrity: j.integrity }, () => {
+        // "Could not establish connection" just means no sidepanel is open
+        // right now — expected, not logged. Anything else is a genuine
+        // delivery failure worth surfacing (this message has no persistent
+        // fallback, so a dropped send here is the only chance the UI gets).
+        const err = chrome.runtime.lastError;
+        if (err && !/Could not establish connection/.test(err.message || '')) {
+          noteSilentFailure('sgLocked broadcast', err.message);
+        }
+      });
+    } catch (e) { noteSilentFailure('sgLocked broadcast (sendMessage threw)', e); }
     return true;
   }
   return false;
@@ -2655,7 +2666,7 @@ async function processLoop() {
   setSgGuardCookie(true); // v7.1.39: tell cleaner extensions a run is active
   try {
   const mcfg = MODES[ST.mode] || MODES.balanced;
-  try { await refreshRemoteConfig(); } catch (_) {}
+  try { await refreshRemoteConfig(); } catch (_) {} // best-effort: ST.remoteConfig already holds the last-cached value from startup, so a failed refresh here just means we run on slightly stale (not missing) config
 
   // Helper tabs are created on first use inside fetchAmazonProduct — no pre-warm needed.
   // This lets the job start immediately instead of waiting for tabs to open and load.
@@ -2855,7 +2866,9 @@ async function processLoop() {
       await syncDbDuplicates();
     }
     const s = ST.stats;
-    const summary = `✅ Complete · Found: ${s.found} · Not found: ${s.notFound} · Dupes: ${s.dupes} · DB-Dupes: ${s.dbDupes||0} · Errors: ${s.errors}`;
+    let summary = `✅ Complete · Found: ${s.found} · Not found: ${s.notFound} · Dupes: ${s.dupes} · DB-Dupes: ${s.dbDupes||0} · Errors: ${s.errors}`;
+    if (s.needsReview)     summary += ` · Needs Review: ${s.needsReview}`;
+    if (s.silentFailures)  summary += ` · Silent failures: ${s.silentFailures}`;
     addLog('\n'+summary);
     chrome.runtime.sendMessage({ type:'jobComplete', stats:s }).catch(()=>{});
     try { chrome.notifications.create({ type:'basic', iconUrl:'icons/icon48.png', title:'Brand Website Finder', message:summary }); } catch(_) {}
@@ -3561,7 +3574,11 @@ async function scrapeAmazonByKeywords(msg) {
   await enableAmazonScrapeMode().catch(() => {});
   startTabWatchdog(); // refresh/close any scrape tab that hangs
 
-  try { await refreshRemoteConfig(); } catch (_) { try { await getCachedExtensionConfig(); } catch (__) {} }
+  try { await refreshRemoteConfig(); }
+  catch (e) {
+    try { await getCachedExtensionConfig(); }
+    catch (e2) { noteSilentFailure('remote config refresh + cache fallback both failed before keyword scrape', e2); }
+  }
   const _mode = sgMarketMode();
   const _enabledMk = sgEnabledMarkets();
   const _autoRotate = (_mode === 'auto' && _enabledMk.length > 1);
@@ -4657,6 +4674,18 @@ function addLog(msg) {
   if (LOGS.length > 600) LOGS.splice(0, LOGS.length-600);
   _saveLogsFast(); // fast-path: sidepanel receives update via storage.onChanged
 }
+
+// v7.1.50: shared counter/logger for failures that were previously swallowed
+// by an empty catch block. Not every empty catch needs this (most guard truly
+// best-effort calls where failure is a normal outcome) — this is for the
+// handful of sites where a silent failure could hide lost data or strand the
+// extension in a broken state. Counted on ST.stats (not a module-level var) so
+// it resets along with the rest of the run's stats at the start of each run.
+function noteSilentFailure(context, err) {
+  ST.stats.silentFailures = (ST.stats.silentFailures || 0) + 1;
+  const msg = (err && err.message) || err || 'unknown error';
+  addLog(`  ⚠️ [silent-failure] ${context}: ${msg}`);
+}
 // Throttle broadcast to at most once per 250 ms — prevents flooding sidepanel.
 // Only the new results since last broadcast are sent; sidepanel appends them.
 let _broadcastTimer = null;
@@ -4864,11 +4893,15 @@ async function _reloadNow() {
   // Hard fallback: a storage write should take milliseconds, but never let a hung
   // one strand every worker in the _reloadPending spin — force the reload after 5s
   // regardless. (Normal path clears this the instant the writes land.)
-  const hardReload = setTimeout(() => { try { chrome.runtime.reload(); } catch (_) {} }, 5000);
-  try { await _persistRuntimeState(); } catch (_) {}
-  try { await saveFullState_(); } catch (_) {}
+  const hardReload = setTimeout(() => {
+    try { chrome.runtime.reload(); }
+    catch (e) { noteSilentFailure('self-heal hard-fallback reload (5s timeout path)', e); }
+  }, 5000);
+  try { await _persistRuntimeState(); } catch (e) { noteSilentFailure('_persistRuntimeState before self-heal reload', e); }
+  try { await saveFullState_(); } catch (e) { noteSilentFailure('saveFullState_ before self-heal reload', e); }
   clearTimeout(hardReload);
-  try { chrome.runtime.reload(); } catch (_) { _reloadPending = false; _reloadInFlight = false; }
+  try { chrome.runtime.reload(); }
+  catch (e) { _reloadPending = false; _reloadInFlight = false; noteSilentFailure('self-heal reload (main path) — service worker may now be stranded', e); }
 }
 
 // Debounced hot save — coalesces rapid per-item calls into one write every 2 s
@@ -6581,7 +6614,7 @@ async function searchWithEngine(brand, tabTimeout, engine) {
 
       if (readiness.status === 'blocked') {
         addLog(`  🚨 ${label} ${readiness.reason || 'rate limit/CAPTCHA'} detected — skipping`);
-        chrome.runtime.sendMessage({ type:'captchaAlert', engine:label }).catch(()=>{});
+        chrome.runtime.sendMessage({ type:'captchaAlert', engine:label }).catch(()=>{}); // best-effort UI toast only — the CAPTCHA/block event itself is already addLog()'d above, so a dropped toast doesn't lose data
         break;
       }
 
@@ -6595,7 +6628,7 @@ async function searchWithEngine(brand, tabTimeout, engine) {
 
       if (await detectCaptcha(tid)) {
         addLog(`  🚨 ${label} CAPTCHA detected — skipping`);
-        chrome.runtime.sendMessage({ type:'captchaAlert', engine:label }).catch(()=>{});
+        chrome.runtime.sendMessage({ type:'captchaAlert', engine:label }).catch(()=>{}); // best-effort UI toast only — the CAPTCHA/block event itself is already addLog()'d above, so a dropped toast doesn't lose data
         break;
       }
 
@@ -7836,7 +7869,7 @@ async function handleCaptchaEnhanced(tabId, engine) {
     type: 'captchaAlert',
     engine: engine || 'unknown',
     enhanced: true,
-  }).catch(() => {});
+  }).catch(() => {}); // best-effort UI toast only — already addLog()'d above
 
   return false;
 }
