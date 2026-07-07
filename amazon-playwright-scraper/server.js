@@ -1,10 +1,28 @@
 const express = require('express');
 const cors    = require('cors');
 const fs      = require('fs');
+const os      = require('os');
 const path    = require('path');
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 chromium.use(stealth);
+
+// ── Minimal .env loader (no new dependency) ─────────────────────────────────
+// Reads a .env file next to this script, if present, and merges KEY=VALUE
+// lines into process.env (never overrides a var already set in the real
+// environment). See .env.example for the full list of supported keys.
+(function loadDotEnv() {
+  try {
+    const envPath = path.join(__dirname, '.env');
+    if (!fs.existsSync(envPath)) return;
+    for (const line of fs.readFileSync(envPath, 'utf-8').split(/\r?\n/)) {
+      const m = line.match(/^\s*([A-Z0-9_]+)\s*=\s*(.*?)\s*$/i);
+      if (!m || line.trim().startsWith('#')) continue;
+      const [, key, rawVal] = m;
+      if (process.env[key] === undefined) process.env[key] = rawVal.replace(/^["']|["']$/g, '');
+    }
+  } catch (_) { /* .env is optional — a load error here just means defaults apply */ }
+})();
 
 const app = express();
 
@@ -31,11 +49,27 @@ const MAX_KEYWORDS = 500;
 const MAX_PAGES    = 20;
 const ALLOWED_DOMAIN = /^amazon\.(com|co\.uk|ca|de|fr|co\.jp|com\.au|es|it|nl)$/i;
 
-const CONCURRENCY      = 1;
+// Higher CONCURRENCY = faster scraping but more parallel Amazon requests from
+// this IP, which raises block risk. 1 is the safe default; raise it only if
+// you have proxy rotation or accept a higher block rate.
+const CONCURRENCY      = Number(process.env.SG_CONCURRENCY) || 1;
+// Headed (visible) Chrome windows are the current default — headless is more
+// detectable to Amazon's bot checks, so this is opt-in, not opt-out.
+const HEADLESS         = process.env.SG_HEADLESS === 'true';
 const BATCH_DELAY      = 3000;  // ms cooldown between batches
 const RESET_WAIT_MIN   = 30000; // ms min wait after block before relaunch
 const RESET_WAIT_MAX   = 60000; // ms max wait
-const SAVE_FOLDER      = 'C:\\Users\\chkam\\OneDrive\\Desktop\\Scrapped';
+const SAVE_FOLDER      = process.env.SG_SAVE_FOLDER || path.join(os.homedir(), 'Scrapped');
+
+// ── Simulated shopper location ──────────────────────────────────────────────
+// Amazon personalizes search/availability by locale. These defaults reproduce
+// the original hardcoded NYC/ZIP-10003 profile; override via env if you need
+// a different region.
+const SCRAPE_ZIP      = process.env.SG_ZIP      || '10003';
+const SCRAPE_LOCALE   = process.env.SG_LOCALE   || 'en-US';
+const SCRAPE_TIMEZONE = process.env.SG_TIMEZONE || 'America/New_York';
+const SCRAPE_LAT      = Number(process.env.SG_LAT) || 40.7302;
+const SCRAPE_LON      = Number(process.env.SG_LON) || -73.9877;
 
 // ── Proxy rotation ─────────────────────────────────────────────────────────
 // Add proxies as 'http://user:pass@host:port' or 'http://host:port'.
@@ -148,8 +182,8 @@ async function scrapeKeyword(page, kw, domain, maxPages, shouldStop) {
     kw
   ).catch(() => {});
 
-  // Enforce ZIP 10003 — handle Amazon's "Choose your location" modal if it appears
-  await enforceZip(page, '10003');
+  // Enforce configured ZIP — handle Amazon's "Choose your location" modal if it appears
+  await enforceZip(page, SCRAPE_ZIP);
 
   const items = [];
 
@@ -243,7 +277,7 @@ async function resetAndWarm(oldBrowser, jobId, domain) {
   jobLog(jobId, `  🔄 Browser reset — waiting ${Math.round(waitMs / 1000)}s before relaunch…`);
   await sleep(waitMs);
 
-  const newBrowser = await chromium.launch({ headless: false });
+  const newBrowser = await chromium.launch({ headless: HEADLESS });
 
   // Warm up 2–3 tabs on amazon.com — establishes session before real scraping
   const warmCount = 2 + Math.floor(Math.random() * 2); // 2 or 3
@@ -252,8 +286,8 @@ async function resetAndWarm(oldBrowser, jobId, domain) {
   for (let i = 0; i < warmCount; i++) {
     const warmProxy = nextProxy();
     const warmOpts  = {
-      locale: 'en-US', timezoneId: 'America/New_York',
-      geolocation: { longitude: -73.9877, latitude: 40.7302 },
+      locale: SCRAPE_LOCALE, timezoneId: SCRAPE_TIMEZONE,
+      geolocation: { longitude: SCRAPE_LON, latitude: SCRAPE_LAT },
       permissions: ['geolocation'],
       userAgent: randomUA(),
       viewport:  { width: 1366 + Math.floor(Math.random() * 200), height: 768 + Math.floor(Math.random() * 100) },
@@ -261,7 +295,7 @@ async function resetAndWarm(oldBrowser, jobId, domain) {
     };
     if (warmProxy) warmOpts.proxy = warmProxy;
     const ctx = await newBrowser.newContext(warmOpts);
-    await ctx.addCookies([{ name: 'x-amz-postal-code', value: '10003', domain: '.' + domain, path: '/' }]);
+    await ctx.addCookies([{ name: 'x-amz-postal-code', value: SCRAPE_ZIP, domain: '.' + domain, path: '/' }]);
     await ctx.route('**/*', route => {
       const t = route.request().resourceType();
       if (['image', 'media', 'font', 'stylesheet'].includes(t)) return route.abort();
@@ -340,7 +374,7 @@ app.post('/scrape', async (req, res) => {
 
   jobLog(jobId, `Starting scrape for ${cleanKeywords.length} keywords${PROXIES.length ? ` (${PROXIES.length} proxies configured)` : ' (no proxy)'}`);
 
-  let browser = await chromium.launch({ headless: false });
+  let browser = await chromium.launch({ headless: HEADLESS });
 
   const job = jobs.get(jobId);
 
@@ -348,9 +382,9 @@ app.post('/scrape', async (req, res) => {
   async function runKeyword(kw) {
     const proxy   = nextProxy();
     const ctxOpts = {
-      locale:      'en-US',
-      timezoneId:  'America/New_York',
-      geolocation: { longitude: -73.9877, latitude: 40.7302 },
+      locale:      SCRAPE_LOCALE,
+      timezoneId:  SCRAPE_TIMEZONE,
+      geolocation: { longitude: SCRAPE_LON, latitude: SCRAPE_LAT },
       permissions: ['geolocation'],
       userAgent:   randomUA(),
       viewport:    { width: 1366 + Math.floor(Math.random() * 200), height: 768 + Math.floor(Math.random() * 100) },
@@ -359,7 +393,7 @@ app.post('/scrape', async (req, res) => {
     if (proxy) ctxOpts.proxy = proxy;
     const context = await browser.newContext(ctxOpts);
     await context.addCookies([{
-      name: 'x-amz-postal-code', value: '10003', domain: '.' + domain, path: '/',
+      name: 'x-amz-postal-code', value: SCRAPE_ZIP, domain: '.' + domain, path: '/',
     }]);
     await context.route('**/*', route => {
       const t = route.request().resourceType();
