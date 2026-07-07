@@ -1684,199 +1684,6 @@ function _parseAmazonHtml(html, url) {
   return { brand, asin, title, hasProductMarkers, hasCaptcha: false };
 }
 
-// ── v7.1.44: TABLESS Amazon Search HTML Parser ─────────────────────────────
-// Regex-parses Amazon search results HTML for ASINs, brand hints, and pagination
-// without a DOM (service worker context). Same proven approach as _parseAmazonHtml.
-function _parseAmazonSearchHtml(html, domain) {
-  const decode = (t) => (t || '')
-    .replace(/&amp;/g, '&').replace(/&#0?39;|&apos;/g, "'").replace(/&quot;/g, '"')
-    .replace(/&nbsp;/g, ' ').replace(/&[a-z]+;/gi, ' ');
-
-  const items = [];
-  const seenASIN = new Set();
-
-  // ── Extract search result cards via data-asin + data-component-type ─────
-  // Pattern: <div data-asin="B0XXXXXX" data-component-type="s-search-result" ... > ... </div>
-  // We scan for each data-asin attribute that has s-search-result type nearby
-  const cardRegex = /data-asin="([A-Z0-9]{10})"[^>]*data-component-type="s-search-result"/gi;
-  const cardRegex2 = /data-component-type="s-search-result"[^>]*data-asin="([A-Z0-9]{10})"/gi;
-  let match;
-
-  // Collect all ASIN positions in the HTML so we can extract brand hints per card
-  const asinPositions = [];
-  // Try both attribute orderings
-  while ((match = cardRegex.exec(html)) !== null) {
-    const asin = match[1].toUpperCase();
-    if (!seenASIN.has(asin)) { seenASIN.add(asin); asinPositions.push({ asin, pos: match.index }); }
-  }
-  while ((match = cardRegex2.exec(html)) !== null) {
-    const asin = match[1].toUpperCase();
-    if (!seenASIN.has(asin)) { seenASIN.add(asin); asinPositions.push({ asin, pos: match.index }); }
-  }
-
-  // Fallback: just scan for any data-asin="X" on the page (less precise but catches layout changes)
-  if (asinPositions.length === 0) {
-    const looseRegex = /data-asin="([A-Z0-9]{10})"/gi;
-    while ((match = looseRegex.exec(html)) !== null) {
-      const asin = match[1].toUpperCase();
-      if (asin.length >= 5 && !seenASIN.has(asin)) {
-        seenASIN.add(asin);
-        asinPositions.push({ asin, pos: match.index });
-      }
-    }
-  }
-
-  const origin = `https://www.${domain || 'amazon.com'}`;
-
-  for (const { asin, pos } of asinPositions) {
-    // Extract a ~4KB window around the ASIN position for brand hint extraction
-    const cardHtml = html.slice(pos, pos + 4000);
-
-    // Build the product URL
-    let url = `${origin}/dp/${asin}`;
-    // Try to find a better link inside the card
-    const linkMatch = cardHtml.match(/href="([^"]*\/dp\/[A-Z0-9]{10}[^"]*)"/i);
-    if (linkMatch) {
-      const href = linkMatch[1].split('/ref=')[0].split('?')[0];
-      url = href.startsWith('http') ? href : origin + href;
-    }
-
-    // Brand hint extraction from the card's HTML
-    let brandHint = '';
-    // 1. data-cy="title-recipe-brand-name" span
-    const brandCy = cardHtml.match(/data-cy="title-recipe-brand-name"[^>]*>([^<]+)</i);
-    if (brandCy) brandHint = decode(brandCy[1]).trim();
-    // 2. "s-line-clamp-1" span (brand row in search results)
-    if (!brandHint) {
-      const clamp = cardHtml.match(/s-line-clamp-1[^>]*>[^<]*<span[^>]*>([^<]+)</i);
-      if (clamp) brandHint = decode(clamp[1]).trim();
-    }
-    // 3. "a-size-base-plus" span (brand text)
-    if (!brandHint) {
-      const base = cardHtml.match(/a-size-base-plus[^>]*>([^<]+)</i);
-      if (base) brandHint = decode(base[1]).trim();
-    }
-    // Clean the brand hint
-    if (brandHint) {
-      brandHint = brandHint.replace(/^Brand:\s*/i, '').split('\n')[0].trim().slice(0, 60);
-      if (brandHint.length <= 1) brandHint = '';
-    }
-
-    items.push({ asin, url, brandHint });
-  }
-
-  // ── Extract next-page URL ────────────────────────────────────────────────
-  let nextUrl = null;
-  // Pattern: class="s-pagination-next" href="..."
-  const nextMatch = html.match(/class="s-pagination-next"[^>]*href="([^"]+)"/i)
-    || html.match(/aria-label="Go to next page"[^>]*href="([^"]+)"/i)
-    || html.match(/s-pagination-next[^>]*href="([^"]+)"/i);
-  if (nextMatch) {
-    const href = decode(nextMatch[1]);
-    // Skip if it has s-pagination-disabled
-    const around = html.slice(Math.max(0, nextMatch.index - 50), nextMatch.index + 200);
-    if (!/s-pagination-disabled/i.test(around)) {
-      nextUrl = href.startsWith('http') ? href : origin + href;
-    }
-  }
-
-  // ── Detect CAPTCHA/block ─────────────────────────────────────────────────
-  const blocked =
-    /api-services-support@amazon|To discuss automated access|errors\/validateCaptcha|opfcaptcha|Type the characters you see|Enter the characters you see below|Robot Check|Sorry! Something went wrong/i.test(html.slice(0, 12000))
-    && items.length === 0;
-
-  return { items, nextUrl, blocked };
-}
-
-
-// ── v7.1.44: TABLESS Amazon Search Fetch ───────────────────────────────────
-// Fetches Amazon search results via fetch() — zero CAPTCHAs, shares the AIMD
-// concurrency pool. Same stealth approach as fetchAmazonProduct but for /s?k=.
-async function fetchAmazonSearchResults(keyword, domain, page, prevNextUrl) {
-  const d = domain || 'amazon.com';
-  const searchUrl = prevNextUrl || `https://www.${d}/s?k=${encodeURIComponent(keyword)}${page > 1 ? '&page=' + page : ''}`;
-  const timeout = 15000;
-  const maxAttempts = 3;
-  const empty = { items: [], nextUrl: null, blocked: false };
-
-  await _acquireAmazonFetchSlot();
-  try {
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      if (!ST.running && !ST.scrapeProgress.active) return empty;
-
-      // v7.1.47: honour the wall breaker — during the rest, search fetches were the
-      // one Amazon path still firing (the product path already bails here), keeping
-      // the IP limit tripped. Flag blocked so the tab fallback / retry handles it.
-      if (Date.now() < _wallBreakerUntil) return { ...empty, blocked: true };
-
-      // Respect the shared cooldown after any recent block
-      const wait = _amazonFetchCooldownUntil - Date.now();
-      if (wait > 0) await sleep(Math.min(wait, 5000));
-      // Minimal jitter when competing
-      if (_amazonFetchActive > 1) await sleep(50 + Math.floor(Math.random() * 150));
-      // v7.1.46: hold at the adaptive per-IP request-rate ceiling before firing.
-      await _awaitAmazonRateToken();
-
-      try {
-        const ua = _randomUA();
-        const creds = attempt > 1 ? 'omit' : 'include';
-        const resp = await fetch(searchUrl, {
-          headers: {
-            ...getStealthHeaders(ua),
-            'Referer': `https://www.${d}/`,
-          },
-          credentials: creds,
-          redirect: 'follow',
-          signal: AbortSignal.timeout(timeout),
-        });
-
-        if (resp.status === 503 || resp.status === 429 || resp.status === 403) {
-          _amazonFetchCooldownUntil = Date.now() + Math.min(2000 * attempt, 5000);
-          _amazonFetchPenalty();
-          // v7.1.44: throttled — per-worker rotation nuked the shared session
-          await rotateIdentityThrottled();
-          if (attempt < maxAttempts) { await sleep(500 * attempt + Math.floor(Math.random() * 300)); continue; }
-          return { ...empty, blocked: true };
-        }
-
-        const html = await resp.text();
-
-        // Check for hard block
-        const looksBlocked =
-          /api-services-support@amazon|To discuss automated access|errors\/validateCaptcha|opfcaptcha|Type the characters you see|Enter the characters you see below|Robot Check|Click the button below to continue shopping|Sorry! Something went wrong/i.test(html.slice(0, 12000))
-          && !/data-component-type="s-search-result"/i.test(html.slice(0, 200000));
-
-        if (looksBlocked) {
-          _amazonFetchCooldownUntil = Date.now() + Math.min(2000 * attempt, 5000);
-          _amazonFetchPenalty();
-          // v7.1.44: throttled — per-worker rotation nuked the shared session
-          await rotateIdentityThrottled();
-          if (attempt === 1) { await sleep(400); continue; } // retry once with omit
-          return { ...empty, blocked: true };
-        }
-
-        const parsed = _parseAmazonSearchHtml(html, d);
-        if (parsed.items.length > 0) {
-          _amazonFetchReward();
-          snapshotAmazonCookies().catch(() => {});
-          return parsed;
-        }
-
-        // No items but no obvious block either — transient empty / redirected page
-        if (attempt < maxAttempts) { await sleep(400 * attempt); continue; }
-        // After max attempts with zero items, flag as soft-block so tab fallback fires
-        return { ...empty, blocked: true };
-      } catch (e) {
-        if (attempt < maxAttempts) { await sleep(500 * attempt); continue; }
-        // Network error on final attempt — flag for tab fallback
-        return { ...empty, blocked: true };
-      }
-    }
-    return empty;
-  } finally {
-    _releaseAmazonFetchSlot();
-  }
-}
 
 
 // ── v7.1.44: Session Cookie Seeding ────────────────────────────────────────
@@ -2867,8 +2674,9 @@ async function processLoop() {
     }
     const s = ST.stats;
     let summary = `✅ Complete · Found: ${s.found} · Not found: ${s.notFound} · Dupes: ${s.dupes} · DB-Dupes: ${s.dbDupes||0} · Errors: ${s.errors}`;
-    if (s.needsReview)     summary += ` · Needs Review: ${s.needsReview}`;
-    if (s.silentFailures)  summary += ` · Silent failures: ${s.silentFailures}`;
+    if (s.needsReview)        summary += ` · Needs Review: ${s.needsReview}`;
+    if (s.silentFailures)     summary += ` · Silent failures: ${s.silentFailures}`;
+    if (s.brandParseFailures) summary += ` · Parse failures: ${s.brandParseFailures}`;
     addLog('\n'+summary);
     chrome.runtime.sendMessage({ type:'jobComplete', stats:s }).catch(()=>{});
     try { chrome.notifications.create({ type:'basic', iconUrl:'icons/icon48.png', title:'Brand Website Finder', message:summary }); } catch(_) {}
@@ -3062,9 +2870,14 @@ async function processItem(item, mcfg) {
 
   if (!res.brand) {
     if (_sawProductPage) {
-      // The product page genuinely loaded and had no brand — this is a real skip.
+      // The product page genuinely loaded (200, product markers present) but the
+      // brand parser extracted nothing — this is a real skip, but ALSO a signal
+      // worth tracking separately from network errors: a rising count here means
+      // Amazon's brand-selector markup drifted (or this was an undetected soft
+      // block), not that these products genuinely lack a brand. See task P1-3.
       res.status = 'skipped'; res.notes = 'Brand not found on Amazon page';
-      addLog('  ⏭  Skipped — product page loaded, no brand present');
+      ST.stats.brandParseFailures = (ST.stats.brandParseFailures || 0) + 1;
+      addLog('  ⏭  Skipped — product page loaded, no brand present (parse-failure signal)');
       addToSkippedBank(res).catch(() => {});
     } else {
       // The page was blocked / never loaded — NOT a genuine skip. Flag as blocked
@@ -3719,6 +3532,11 @@ async function scrapeAmazonByKeywords(msg) {
             if (!result.nextUrl) { if (page < maxPages) addLog(`    ℹ️  Last page reached for "${kw.slice(0,28)}"`); break; }
             nextUrl = result.nextUrl;
           } else {
+            // Page loaded (no exception thrown, tab wasn't walled) but the
+            // [data-asin] card query found nothing — either genuinely no results
+            // for this keyword, or Amazon's search-card markup drifted. Counted
+            // separately from network/tab errors so a spike is visible.
+            ST.scrapeProgress.emptyPages = (ST.scrapeProgress.emptyPages || 0) + 1;
             addLog(`    ⚠️ ${tag}P${page} "${kw.slice(0,28)}": 0 cards — empty results`);
             break; // page loaded but no results — genuinely nothing for this keyword
           }
@@ -3809,7 +3627,8 @@ async function scrapeAmazonByKeywords(msg) {
   const unique = [...allItems.values()];
   if (!unique.length) { stopTabWatchdog(); addLog('⚠️ No ASINs collected from keywords'); broadcast(); return; }
 
-  addLog(`\n✅ Keyword scrape done: ${unique.length} unique ASIN${unique.length>1?'s':''}`);
+  const _emptyPages = ST.scrapeProgress.emptyPages || 0;
+  addLog(`\n✅ Keyword scrape done: ${unique.length} unique ASIN${unique.length>1?'s':''}${_emptyPages ? ` · ${_emptyPages} empty page(s) (0-card, possible selector drift)` : ''}`);
 
   ST.queue = unique.map((item, i) => ({ idx:i, raw:item.url, asin:item.asin, url:item.url, brandHint:item.brandHint||'' }));
   ST.idx = 0; ST.results = [];
