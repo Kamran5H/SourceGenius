@@ -111,6 +111,17 @@ function makeJobId() {
   return `${ts}-${rand}`;
 }
 
+// Clean up jobs older than 2 hours (parse timestamp as UTC by appending Z)
+function cleanupOldJobs() {
+  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
+  const toDelete = [];
+  for (const [id] of jobs) {
+    const ts = id.slice(0, 23).replace(/-/g, (m, i) => i === 10 ? 'T' : i === 13 || i === 16 ? ':' : i === 19 ? '.' : '-') + 'Z';
+    if (new Date(ts).getTime() < cutoff) toDelete.push(id);
+  }
+  toDelete.forEach(id => jobs.delete(id));
+}
+
 function jobLog(jobId, msg) {
   console.log(`[${jobId}] ${msg}`);
   const job = jobs.get(jobId);
@@ -357,26 +368,39 @@ app.post('/scrape', async (req, res) => {
     stopRequested: false,
   });
 
-  // Clean up jobs older than 2 hours (parse timestamp as UTC by appending Z)
-  const cutoff = Date.now() - 2 * 60 * 60 * 1000;
-  const toDelete = [];
-  for (const [id] of jobs) {
-    const ts = id.slice(0, 23).replace(/-/g, (m, i) => i === 10 ? 'T' : i === 13 || i === 16 ? ':' : i === 19 ? '.' : '-') + 'Z';
-    if (new Date(ts).getTime() < cutoff) toDelete.push(id);
-  }
-  toDelete.forEach(id => jobs.delete(id));
+  cleanupOldJobs();
 
   // Create the job folder NOW — before any scraping, so saves never race mkdir
   fs.mkdirSync(jobFolder, { recursive: true });
   console.log(`📁 Job folder created: ${jobFolder}`);
 
+  const jobPromise = runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, filename });
+
+  // ?wait=1 — old blocking behavior, kept for any existing caller/tooling that
+  // expects the full result set in the HTTP response.
+  if (req.query.wait === '1') {
+    const final = await jobPromise;
+    return res.json({ success: true, jobId, count: final.length, file: filename, folder: jobFolder, results: final });
+  }
+
+  // Default: non-blocking. The job runs in the background; the client polls
+  // /status?jobId=... for progress and reads the CSV (or /stop to cancel).
+  // A holding request open for a multi-thousand-keyword job would exceed most
+  // client/proxy HTTP timeouts long before Playwright finishes.
+  jobPromise.catch(err => jobLog(jobId, `⚠️ Unhandled job error: ${err.message}`));
+  res.json({ success: true, jobId, message: `Job started — poll /status?jobId=${jobId}` });
+});
+
+// Jobs finish outside the request/response cycle now (see ?wait=1 note above),
+// so the actual scrape work lives in its own function rather than inline in
+// the route handler.
+async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, filename }) {
+  const job = jobs.get(jobId);
   const allASINs = new Map();
 
   jobLog(jobId, `Starting scrape for ${cleanKeywords.length} keywords${PROXIES.length ? ` (${PROXIES.length} proxies configured)` : ' (no proxy)'}`);
 
   let browser = await chromium.launch({ headless: HEADLESS });
-
-  const job = jobs.get(jobId);
 
   // Helper: open one context+page, scrape kw, close context
   async function runKeyword(kw) {
@@ -486,11 +510,8 @@ app.post('/scrape', async (req, res) => {
   }
 
   if (job) job.progress.done = true;
-
-  // Blocking response — returns when job is complete, same as before
-  // jobId is included so background.js can use it for future /stop calls
-  res.json({ success: true, jobId, count: final.length, file: filename, folder: jobFolder, results: final });
-});
+  return final;
+}
 
 app.post('/stop', (req, res) => {
   const { jobId } = req.body;
