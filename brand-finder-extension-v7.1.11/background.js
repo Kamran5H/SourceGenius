@@ -2533,7 +2533,6 @@ async function processLoop() {
             : mcfg.delayMs;
           await sleep(d);
         }
-        if (myIdx !== null) _inFlightIndices.delete(myIdx);
       } catch (e) {
         if (typeof myIdx !== 'undefined' && myIdx !== null) _inFlightIndices.delete(myIdx);
         addLog(`  ❌ Worker thread error: ${e.message}`);
