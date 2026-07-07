@@ -478,15 +478,28 @@ chrome.storage.local.get(['cfg','logs','logsTotal','results','userProfile','memb
   if (r._sgRuntime && typeof r._sgRuntime === 'object') {
     const rs = r._sgRuntime, num = (v) => typeof v === 'number' && isFinite(v);
     const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    if (num(rs.rate))             _amazonRatePerSec           = clamp(rs.rate, AMAZON_RATE_MIN, AMAZON_RATE_MAX);
-    if (num(rs.fetchLimit))       _amazonFetchLimit           = clamp(rs.fetchLimit, AMAZON_FETCH_MIN, AMAZON_FETCH_MAX);
-    if (num(rs.wallStrikes))      _wallStrikes                = Math.max(0, rs.wallStrikes);
+    // v7.1.50: the snapshot is now written on every back-off (not only at the
+    // deliberate self-heal reload), so it also survives a watchdog crash-reload
+    // or an MV3 kill. But only inherit the LEARNED backoff if the snapshot is
+    // recent — if the SW sat dead for >10 min (laptop closed, etc.) the IP has
+    // likely cooled, so a fresh start is better than resuming an hours-old
+    // throttle. The absolute-timestamp fields restore unconditionally: they are
+    // inert once in the past, and honoured if still in the future (e.g. an open
+    // wall-rest that a prompt restart must keep observing).
+    const fresh = _runtimeSnapshotIsFresh(rs, Date.now());
+    if (fresh && num(rs.rate))          _amazonRatePerSec    = clamp(rs.rate, AMAZON_RATE_MIN, AMAZON_RATE_MAX);
+    if (fresh && num(rs.fetchLimit))    _amazonFetchLimit    = clamp(rs.fetchLimit, AMAZON_FETCH_MIN, AMAZON_FETCH_MAX);
+    if (fresh && num(rs.wallStrikes))   _wallStrikes         = Math.max(0, rs.wallStrikes);
+    if (fresh && num(rs.captchaStreak)) _amazonCaptchaStreak = Math.max(0, rs.captchaStreak);
+    if (fresh && typeof rs.humanMode === 'boolean') _amazonHumanMode = rs.humanMode;
+    if (fresh && num(rs.tabLimit))      _amazonTabLimit      = clamp(rs.tabLimit, AMAZON_TAB_RECOVER, AMAZON_TAB_MAX);
+    if (fresh && num(rs.cleanStreak))   _amazonCleanStreak   = Math.max(0, rs.cleanStreak);
+    // Absolute timestamps + the rerun budget — safe to restore regardless of
+    // snapshot age (timestamps are inert once past; the rerun counter is a loop
+    // cap, not IP-reputation state, and its original intent was to always survive
+    // a reload so a run can't loop past its round budget).
     if (num(rs.wallBreakerUntil)) _wallBreakerUntil           = rs.wallBreakerUntil;
     if (num(rs.captchaUntil))     _amazonCaptchaCooldownUntil = rs.captchaUntil;
-    if (num(rs.captchaStreak))    _amazonCaptchaStreak        = Math.max(0, rs.captchaStreak);
-    if (typeof rs.humanMode === 'boolean') _amazonHumanMode  = rs.humanMode;
-    if (num(rs.tabLimit))         _amazonTabLimit             = clamp(rs.tabLimit, AMAZON_TAB_RECOVER, AMAZON_TAB_MAX);
-    if (num(rs.cleanStreak))      _amazonCleanStreak          = Math.max(0, rs.cleanStreak);
     if (num(rs.lastRotate))       _lastIdentityRotateAt       = rs.lastRotate;
     if (num(rs.autoRerunRound))   _autoRerunRound             = Math.max(0, rs.autoRerunRound);
     chrome.storage.local.remove('_sgRuntime').catch(() => {});
@@ -1590,6 +1603,12 @@ function _amazonRatePenalty() {
   const prev = _amazonRatePerSec;
   _amazonRatePerSec = Math.max(AMAZON_RATE_MIN, _amazonRatePerSec / 2);
   if (_amazonRatePerSec !== prev) addLog(`  🐢 Amazon request rate ↓ ${(prev*60).toFixed(0)}→${(_amazonRatePerSec*60).toFixed(0)}/min (rate-limited)`);
+  // v7.1.50: snapshot the backed-off controller state the moment we learn to slow
+  // down, so an UNEXPECTED restart (watchdog crash-reload, MV3 kill) resumes on
+  // this reduced rate instead of the aggressive 24/0.8 defaults and re-hammering
+  // a hot IP. Previously only the deliberate self-heal reload persisted this.
+  // Throttled to once/3s by the guard above.
+  _persistRuntimeState();
 }
 // v7.1.47: reward is now WALL-CLOCK throttled to match the penalty cadence. The
 // old code added +0.08 on EVERY clean page, so with 20 workers the rate sprinted
@@ -1966,6 +1985,9 @@ function _amazonWallStrike() {
     _wallBreakerUntil = Date.now() + WALL_BREAKER_REST_MS;
     addLog(`  🧊 Amazon wall is persistent (${_wallStrikes} consecutive blocks) — resting ALL Amazon tabs ${Math.round(WALL_BREAKER_REST_MS / 1000)}s so the rate limit clears. Blocked items are queued for auto-retry.`);
     rotateIdentityThrottled().catch(() => {}); // one fresh identity for the post-rest resume
+    // v7.1.50: persist the open breaker so an unexpected restart during the rest
+    // window keeps resting instead of resuming straight into the wall.
+    _persistRuntimeState();
   }
 }
 function _amazonWallClear() { _wallStrikes = 0; }
@@ -4659,6 +4681,17 @@ async function saveFullState_() {
 // re-provokes the exact wall we fight; and (b) orphan every Amazon tab the previous
 // worker had open (the new SW instance never learned their ids). This persists both
 // so the reload is invisible to the controller and leaves no stray tabs behind.
+// v7.1.50: pure predicate — is a persisted runtime snapshot recent enough to
+// inherit its LEARNED backoff (rate/concurrency/wall)? A snapshot older than the
+// window means the SW sat dead a while (laptop closed, crash + long gap); the IP
+// has likely cooled, so a fresh start beats resuming a stale throttle. Extracted
+// as a named pure function so it's unit-testable (see test/background.test.js).
+const RUNTIME_SNAPSHOT_MAX_AGE_MS = 600000; // 10 min
+function _runtimeSnapshotIsFresh(rs, now) {
+  return !!(rs && typeof rs.savedAt === 'number' && isFinite(rs.savedAt)
+    && (now - rs.savedAt) >= 0 && (now - rs.savedAt) < RUNTIME_SNAPSHOT_MAX_AGE_MS);
+}
+
 async function _persistRuntimeState() {
   try {
     await chrome.storage.local.set({
@@ -4776,7 +4809,14 @@ chrome.alarms.onAlarm.addListener(alarm => {
     // So we now only HARD-RELOAD when the run is genuinely WEDGED — no forward
     // progress across a full 2-min window — which is the ONLY case a reload helps.
     // A healthy, progressing run is never reloaded, so the panel never blanks.
-    if (!ST.running || (ST.scrapeProgress && ST.scrapeProgress.active)) { _healthPrev = null; return; }
+    // v7.1.50: during keyword scraping, still keep the keepalive + tab recovery
+    // armed across an SW revival. The scrape is driven by scrapeAmazonByKeywords
+    // (not processLoop), so it can't be "resumed" from here — but a dead keepalive
+    // is exactly what lets the SW suspend mid-scrape and stall, and previously the
+    // health check did NOTHING during the scrape phase. We don't reload here: a
+    // reload mid-scrape has no resume path and would lose scrape progress.
+    if (ST.scrapeProgress && ST.scrapeProgress.active) { startTabWatchdog(); _healthPrev = null; return; }
+    if (!ST.running) { _healthPrev = null; return; }
 
     // Always keep the driver loop + keepalive armed (covers a revived-but-idle SW).
     // This — not reloading — is what actually keeps background runs smooth.
@@ -4815,6 +4855,12 @@ chrome.alarms.onAlarm.addListener(alarm => {
       enableAmazonScrapeMode().catch(() => {});
       startTabWatchdog();        // also re-arms the 20s keepalive
       processLoop().catch(() => {});
+    }
+    // v7.1.50: keep the keepalive armed during the keyword-scrape phase too, so a
+    // revived SW doesn't re-suspend mid-scrape (the scrape itself isn't restarted
+    // here — it has no re-entrant driver — but staying alive lets it keep running).
+    else if (ST.scrapeProgress && ST.scrapeProgress.active) {
+      startTabWatchdog();
     }
   }
   if (alarm.name === 'bwf-heartbeat') doSendHeartbeat().catch(() => {});

@@ -31,7 +31,9 @@ const assembled = [
   extractFunction(src, '_parseAmazonHtml'),
   extractFunction(src, 'extractAsin'),
   extractFunction(src, 'validateResult'),
-  'module.exports = { _parseAmazonHtml, pickSearchCandidate, brandDomainResemblance, domainMatchesBrand, validateResult };',
+  'const RUNTIME_SNAPSHOT_MAX_AGE_MS = 600000;',
+  extractFunction(src, '_runtimeSnapshotIsFresh'),
+  'module.exports = { _parseAmazonHtml, pickSearchCandidate, brandDomainResemblance, domainMatchesBrand, validateResult, _runtimeSnapshotIsFresh };',
 ].join('\n\n');
 
 const {
@@ -40,6 +42,7 @@ const {
   brandDomainResemblance,
   domainMatchesBrand,
   validateResult,
+  _runtimeSnapshotIsFresh,
 } = compileModule(assembled, BG_PATH);
 
 // ── domainMatchesBrand ──────────────────────────────────────────────────────
@@ -173,4 +176,33 @@ test('validateResult: a record with no website is not rejected on URL grounds', 
   // not-found records (no website) shouldn't fail validation just for lacking one
   const res = { url: 'https://www.amazon.com/dp/B0C1D2E3F4', brand: 'Acme', website: '', conf: 0 };
   assert.deepEqual(validateResult(res), { valid: true });
+});
+
+// ── _runtimeSnapshotIsFresh (anti-block controller persistence gate) ──────────
+test('_runtimeSnapshotIsFresh: a snapshot saved seconds ago is inherited', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(_runtimeSnapshotIsFresh({ savedAt: now - 5000 }, now), true);
+});
+
+test('_runtimeSnapshotIsFresh: a snapshot older than 10 min is NOT inherited (IP has likely cooled)', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(_runtimeSnapshotIsFresh({ savedAt: now - 11 * 60 * 1000 }, now), false);
+});
+
+test('_runtimeSnapshotIsFresh: just inside the 10 min window is inherited', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(_runtimeSnapshotIsFresh({ savedAt: now - (10 * 60 * 1000 - 1) }, now), true);
+});
+
+test('_runtimeSnapshotIsFresh: missing/garbage savedAt is not fresh (no crash)', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(_runtimeSnapshotIsFresh({}, now), false);
+  assert.equal(_runtimeSnapshotIsFresh(null, now), false);
+  assert.equal(_runtimeSnapshotIsFresh({ savedAt: 'nope' }, now), false);
+});
+
+test('_runtimeSnapshotIsFresh: a future-dated savedAt (clock skew) is not treated as fresh-negative-age', () => {
+  const now = 1_000_000_000_000;
+  // savedAt in the future → now-savedAt is negative → not fresh (guarded)
+  assert.equal(_runtimeSnapshotIsFresh({ savedAt: now + 60000 }, now), false);
 });

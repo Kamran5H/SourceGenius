@@ -102,6 +102,30 @@ browser-independent functions: `domainMatchesBrand`, `brandDomainResemblance`,
 call `app.listen()` on load) — it tests the real, verbatim production source,
 not a reimplementation.
 
+## Reliability: blocking & service-worker restarts
+
+The extension fights Amazon rate-limiting with an adaptive controller (AIMD
+concurrency + a request/second token bucket + a circuit-breaker "wall rest").
+When Amazon walls the IP, the controller *learns* a slower safe rate.
+
+That learned backoff is snapshotted to `chrome.storage` (`_sgRuntime`) so it
+**survives a service-worker restart** — a naive restart would reset the
+controller to its aggressive starting rate and immediately re-trip the wall
+(the wall→recover→wall loop). The snapshot is written on every back-off event
+(not just the deliberate self-heal reload), so it also survives a watchdog
+crash-reload or an MV3 kill; on restart it's inherited only if fresh (saved
+within 10 min — `_runtimeSnapshotIsFresh()`, unit-tested), since a
+long-dead-then-revived worker has likely seen its IP cool down and is better
+off starting clean.
+
+The MV3 keepalive is kept armed during the keyword-scrape phase too, not just
+the website-finder phase, so the worker doesn't suspend mid-scrape.
+
+**Honest limit:** blocking cannot be eliminated — it's an inherent consequence
+of operating against Amazon's ToS (see below). These mechanisms make the tool
+back off politely and recover cleanly; they do not, and are not intended to,
+make the scraping undetectable.
+
 ## Known limitations & risks
 
 - **Accuracy ceiling.** Brand-to-website matching is a heuristic, multi-tier
