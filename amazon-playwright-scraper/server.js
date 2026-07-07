@@ -445,8 +445,11 @@ app.post('/scrape', async (req, res) => {
   }
 
   const final = Array.from(allASINs.values());
-  saveCSV(final, filename, jobFolder);
-  jobLog(jobId, `✅ Done — ${final.length} unique ASINs saved to ${jobFolder}\\${filename}`);
+  const saveResult = saveCSV(final, filename, jobFolder);
+  jobLog(jobId, `✅ Done — ${saveResult.validCount} unique ASINs saved to ${jobFolder}\\${filename}`);
+  if (saveResult.needsReviewCount) {
+    jobLog(jobId, `⚠️ ${saveResult.needsReviewCount} row(s) failed validation — see ${filename.replace(/\.csv$/i, '')}.needs_review.csv`);
+  }
 
   if (job) job.progress.done = true;
 
@@ -468,14 +471,51 @@ app.post('/stop', (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Result validation ────────────────────────────────────────────────────────
+// Gate before any row is committed to CSV — mirrors the validateResult() gate
+// in the extension's background.js. Catches malformed ASINs/URLs mechanically
+// so a scraper hiccup or selector drift can't silently produce junk rows that
+// look like clean scrape results downstream.
+const ASIN_RE = /^[A-Z0-9]{10}$/;
+function validateAsinRecord(r) {
+  const reasons = [];
+  if (!r.asin || !ASIN_RE.test(r.asin)) reasons.push(`invalid ASIN "${r.asin || '(none)'}"`);
+  try {
+    const u = new URL(r.url || '');
+    if (!/^https?:$/.test(u.protocol) || !/\./.test(u.hostname)) reasons.push(`malformed URL "${r.url}"`);
+  } catch (_) { reasons.push(`malformed URL "${r.url}"`); }
+  return reasons.length ? { valid: false, reason: reasons.join('; ') } : { valid: true };
+}
+
 // ── CSV writer ─────────────────────────────────────────────────────────────
 // folder defaults to SAVE_FOLDER — pass jobFolder to isolate per job
+// Rows that fail validateAsinRecord() are quarantined into a sibling
+// "*.needs_review.csv" file instead of being dropped or mixed into the main
+// output, so nothing bad is silently written and nothing is silently lost.
 function saveCSV(rows, filename, folder) {
   const dir = folder || SAVE_FOLDER;
   fs.mkdirSync(dir, { recursive: true }); // no-op if already exists
-  const BOM  = '﻿';
-  const body = rows.map(r => `${r.asin},"${(r.brandHint || '').replace(/"/g, '""')}",${r.url}`).join('\r\n');
+  const BOM = '﻿';
+
+  const valid = [], needsReview = [];
+  for (const r of rows) {
+    const v = validateAsinRecord(r);
+    if (v.valid) valid.push(r);
+    else needsReview.push({ ...r, _reviewReason: v.reason });
+  }
+
+  const body = valid.map(r => `${r.asin},"${(r.brandHint || '').replace(/"/g, '""')}",${r.url}`).join('\r\n');
   fs.writeFileSync(path.join(dir, filename), BOM + 'ASIN,BrandHint,URL\r\n' + body, 'utf-8');
+
+  if (needsReview.length) {
+    const reviewName = filename.replace(/\.csv$/i, '') + '.needs_review.csv';
+    const reviewBody = needsReview
+      .map(r => `${r.asin || ''},"${(r.brandHint || '').replace(/"/g, '""')}",${r.url || ''},"${(r._reviewReason || '').replace(/"/g, '""')}"`)
+      .join('\r\n');
+    fs.writeFileSync(path.join(dir, reviewName), BOM + 'ASIN,BrandHint,URL,ReviewReason\r\n' + reviewBody, 'utf-8');
+  }
+
+  return { validCount: valid.length, needsReviewCount: needsReview.length };
 }
 
 // ── Process safety ─────────────────────────────────────────────────────────

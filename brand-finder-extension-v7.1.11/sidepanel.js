@@ -988,7 +988,7 @@ function applyStatus(s) {
   const pct = st.total > 0 ? Math.round((st.done/st.total)*100) : 0;
   $('pbar').style.width = pct + '%';
   $('plbl').textContent = st.total > 0
-    ? `${st.done}/${st.total} (${pct}%) · Found: ${st.found} · Dupes: ${st.dupes||0} · DB-Dupes: ${st.dbDupes||0} · Errors: ${st.errors||0}`
+    ? `${st.done}/${st.total} (${pct}%) · Found: ${st.found} · Dupes: ${st.dupes||0} · DB-Dupes: ${st.dbDupes||0} · Errors: ${st.errors||0}${st.needsReview ? ' · Needs Review: '+st.needsReview : ''}`
     : 'No job running';
 
   const cur=$('cur'), ctxt=$('ctxt');

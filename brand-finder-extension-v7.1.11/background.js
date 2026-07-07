@@ -2599,12 +2599,16 @@ async function handleProcessedResult(res) {
   // also makes the retry-round rollback (which already does notFound-- for skipped
   // items) correct instead of underflowing against a count it never contributed to.
   if (res.status === 'skipped')      ST.stats.notFound = (ST.stats.notFound || 0) + 1;
+  // v7.1.50: validateResult() quarantine — a "found" record that failed the
+  // sanity gate (bad ASIN/URL/brand/confidence) lands here instead of FOUND,
+  // so it never silently counts as a confirmed match or gets written out.
+  if (res.status === 'needs-review') ST.stats.needsReview = (ST.stats.needsReview || 0) + 1;
 
   // v5.0: Live-write filter ('all' | 'found' | 'no-dupes')
   const lwf = ST.cfg.liveWriteFilter || 'all';
-  const writeToSheet = lwf === 'all' ||
+  const writeToSheet = res.status !== 'needs-review' && (lwf === 'all' ||
     (lwf === 'found' && res.status === 'found') ||
-    (lwf === 'no-dupes' && res.status !== 'duplicate' && res.status !== 'db-duplicate');
+    (lwf === 'no-dupes' && res.status !== 'duplicate' && res.status !== 'db-duplicate'));
 
   // v2.0: Google Sheets push (filtered by v5.0 setting)
   // v6: skip live-write if admin has hidden websites for this member
@@ -3319,7 +3323,16 @@ async function processItem(item, mcfg) {
   }
 
   res.status = res.website ? 'found' : 'not-found';
-  if (!res.website) addLog('  ⏭  No official website found');
+  if (!res.website) {
+    addLog('  ⏭  No official website found');
+  } else {
+    const v = validateResult(res);
+    if (!v.valid) {
+      res.status = 'needs-review';
+      res.notes  = 'Needs review — ' + v.reason;
+      addLog(`  🔍 Needs review — ${v.reason}`);
+    }
+  }
   return res;
 }
 
@@ -4109,7 +4122,9 @@ async function importFromSheet(msg) {
 // ═══════════════════════════════════════════════════════════════
 function buildCsv(results, profile) {
   // v5.0: exclude db-duplicate rows from CSV (they are only highlighted in UI)
-  results = (results||[]).filter(r => r.status !== 'db-duplicate');
+  // v7.1.50: exclude needs-review rows too — they failed validateResult() and
+  // must never look like a confirmed find in the exported CSV.
+  results = (results||[]).filter(r => r.status !== 'db-duplicate' && r.status !== 'needs-review');
   if (!results?.length) return '';
   const esc  = v => '"'+String(v||'').replace(/"/g,'""')+'"';
   // v3: prepend metadata lines if user has a profile
@@ -4209,6 +4224,51 @@ function toAsinUrl(input) {
 }
 function toRootUrl(url) {
   try { const u=new URL(url); return u.protocol+'//'+u.hostname; } catch(_) { return url; }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// v7.1.50: RESULT VALIDATION — the last gate before a record is ever
+// written as "found" to CSV/DB. Heuristic search matching can never be
+// 100% accurate; this catches the failure modes we CAN detect
+// mechanically (malformed ASIN, non-URL website, empty/junk brand,
+// missing confidence) so those records get quarantined into
+// needs-review instead of silently counting as a confirmed find.
+// ═══════════════════════════════════════════════════════════════
+const JUNK_BRAND_NAMES = new Set([
+  'amazon', 'amazon.com', 'visit the store', 'visit the amazon store',
+  'the store', 'brand', 'n/a', 'na', 'unknown', 'store', '-',
+]);
+
+function validateResult(res) {
+  const reasons = [];
+
+  const asin = res.asin || extractAsin(res.url || res.raw || '');
+  if (!asin || !/^[A-Z0-9]{10}$/.test(asin)) {
+    reasons.push(`invalid ASIN "${asin || '(none)'}"`);
+  }
+
+  const brand = String(res.brand || '').trim();
+  if (!brand) {
+    reasons.push('empty brand');
+  } else if (JUNK_BRAND_NAMES.has(brand.toLowerCase())) {
+    reasons.push(`junk brand "${brand}"`);
+  }
+
+  if (res.website) {
+    let hostOk = false;
+    try {
+      const u = new URL(res.website);
+      hostOk = /^https?:$/.test(u.protocol) &&
+        /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(u.hostname);
+    } catch (_) { hostOk = false; }
+    if (!hostOk) reasons.push(`malformed website URL "${res.website}"`);
+  }
+
+  if (typeof res.conf !== 'number' || Number.isNaN(res.conf)) {
+    reasons.push(`non-numeric confidence "${res.conf}"`);
+  }
+
+  return reasons.length ? { valid: false, reason: reasons.join('; ') } : { valid: true };
 }
 
 // ═══════════════════════════════════════════════════════════════
