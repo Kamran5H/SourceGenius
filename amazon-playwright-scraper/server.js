@@ -111,15 +111,15 @@ function makeJobId() {
   return `${ts}-${rand}`;
 }
 
-// Clean up jobs older than 2 hours (parse timestamp as UTC by appending Z)
+// Clean up jobs older than 2 hours. Each job stores its own createdAt
+// (Date.now() at registration) rather than this having to reverse-engineer a
+// timestamp out of the jobId string — jobId's format is an implementation
+// detail of makeJobId() and shouldn't be parsed elsewhere.
 function cleanupOldJobs() {
   const cutoff = Date.now() - 2 * 60 * 60 * 1000;
-  const toDelete = [];
-  for (const [id] of jobs) {
-    const ts = id.slice(0, 23).replace(/-/g, (m, i) => i === 10 ? 'T' : i === 13 || i === 16 ? ':' : i === 19 ? '.' : '-') + 'Z';
-    if (new Date(ts).getTime() < cutoff) toDelete.push(id);
+  for (const [id, job] of jobs) {
+    if ((job.createdAt || 0) < cutoff) jobs.delete(id);
   }
-  toDelete.forEach(id => jobs.delete(id));
 }
 
 function jobLog(jobId, msg) {
@@ -363,6 +363,7 @@ app.post('/scrape', async (req, res) => {
 
   // Register this job — completely isolated from any other job
   jobs.set(jobId, {
+    createdAt:     Date.now(),
     logs:          [],
     progress:      { completedCount: 0, totalCount: cleanKeywords.length, foundCount: 0, filename, folder: jobFolder },
     stopRequested: false,
@@ -491,7 +492,7 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
       job.progress.foundCount = allASINs.size;
 
       // Incremental CSV save — partial results survive if job is stopped early
-      saveCSV(Array.from(allASINs.values()), filename, jobFolder);
+      await saveCSV(Array.from(allASINs.values()), filename, jobFolder);
 
       // Short cooldown between batches
       if (i + CONCURRENCY < cleanKeywords.length && !job.stopRequested) await sleep(BATCH_DELAY);
@@ -503,7 +504,7 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
   }
 
   const final = Array.from(allASINs.values());
-  const saveResult = saveCSV(final, filename, jobFolder);
+  const saveResult = await saveCSV(final, filename, jobFolder);
   jobLog(jobId, `✅ Done — ${saveResult.validCount} unique ASINs saved to ${jobFolder}\\${filename}`);
   if (saveResult.needsReviewCount) {
     jobLog(jobId, `⚠️ ${saveResult.needsReviewCount} row(s) failed validation — see ${filename.replace(/\.csv$/i, '')}.needs_review.csv`);
@@ -542,15 +543,31 @@ function validateAsinRecord(r) {
   return reasons.length ? { valid: false, reason: reasons.join('; ') } : { valid: true };
 }
 
+// Wraps fs.writeFileSync with one retry after a short delay — OneDrive/Windows
+// can transiently lock a file mid-write (cloud sync, AV scan). If the retry
+// also fails, the error propagates so the caller's own error handling (the
+// scrape loop's 'Fatal' log, or the /scrape route's catch) surfaces it
+// instead of the write failure being lost silently.
+async function writeFileWithRetry(filePath, content) {
+  try {
+    fs.writeFileSync(filePath, content, 'utf-8');
+  } catch (err) {
+    console.error(`⚠️ CSV write failed (${err.message}) — retrying once: ${filePath}`);
+    await sleep(300);
+    fs.writeFileSync(filePath, content, 'utf-8'); // let a second failure throw
+  }
+}
+
 // ── CSV writer ─────────────────────────────────────────────────────────────
 // folder defaults to SAVE_FOLDER — pass jobFolder to isolate per job
 // Rows that fail validateAsinRecord() are quarantined into a sibling
 // "*.needs_review.csv" file instead of being dropped or mixed into the main
 // output, so nothing bad is silently written and nothing is silently lost.
-function saveCSV(rows, filename, folder) {
+async function saveCSV(rows, filename, folder) {
   const dir = folder || SAVE_FOLDER;
   fs.mkdirSync(dir, { recursive: true }); // no-op if already exists
   const BOM = '﻿';
+  const esc = v => `"${String(v || '').replace(/"/g, '""')}"`;
 
   const valid = [], needsReview = [];
   for (const r of rows) {
@@ -559,15 +576,18 @@ function saveCSV(rows, filename, folder) {
     else needsReview.push({ ...r, _reviewReason: v.reason });
   }
 
-  const body = valid.map(r => `${r.asin},"${(r.brandHint || '').replace(/"/g, '""')}",${r.url}`).join('\r\n');
-  fs.writeFileSync(path.join(dir, filename), BOM + 'ASIN,BrandHint,URL\r\n' + body, 'utf-8');
+  // url is now quoted/escaped the same way as brandHint — previously it was
+  // written raw, which would corrupt the row if a URL ever contained a comma
+  // or quote character.
+  const body = valid.map(r => `${r.asin},${esc(r.brandHint)},${esc(r.url)}`).join('\r\n');
+  await writeFileWithRetry(path.join(dir, filename), BOM + 'ASIN,BrandHint,URL\r\n' + body);
 
   if (needsReview.length) {
     const reviewName = filename.replace(/\.csv$/i, '') + '.needs_review.csv';
     const reviewBody = needsReview
-      .map(r => `${r.asin || ''},"${(r.brandHint || '').replace(/"/g, '""')}",${r.url || ''},"${(r._reviewReason || '').replace(/"/g, '""')}"`)
+      .map(r => `${r.asin || ''},${esc(r.brandHint)},${esc(r.url)},${esc(r._reviewReason)}`)
       .join('\r\n');
-    fs.writeFileSync(path.join(dir, reviewName), BOM + 'ASIN,BrandHint,URL,ReviewReason\r\n' + reviewBody, 'utf-8');
+    await writeFileWithRetry(path.join(dir, reviewName), BOM + 'ASIN,BrandHint,URL,ReviewReason\r\n' + reviewBody);
   }
 
   return { validCount: valid.length, needsReviewCount: needsReview.length };
