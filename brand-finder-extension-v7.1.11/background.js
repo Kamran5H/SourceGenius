@@ -122,6 +122,37 @@ function setSgGuardCookie(active) {
   } catch (_) {}
 }
 
+// ── v7.1.51: SG VPN Controller signalling ───────────────────────────────────
+// The companion "SG VPN Controller" extension (id below, pinned via its manifest
+// key) switches the Amazon egress IP (chrome.proxy list, or Urban VPN via a native
+// host) in response to events we emit here:
+//   block → connect / rotate to a fresh IP (current IP is walled)
+//   slow  → rotate (only if already connected)
+//   clean → arm a delayed disconnect (Amazon happy again)
+//   idle  → disconnect now (run finished)
+// Cross-extension messaging needs BOTH ids pinned: our manifest "key" fixes THIS
+// extension's id to pdoipfcegfhhijdnlfglfbkcbhhholkk (whitelisted in the
+// controller's externally_connectable), and the controller's id is the constant
+// below. If the controller isn't installed, sendMessage just sets lastError and we
+// swallow it — this whole layer is a safe no-op when the controller is absent.
+const VPN_CONTROLLER_ID = 'ngjffjlldoocjeelhhadimoipbdcdnkd';
+// Per-kind throttle so a burst of blocks/penalties can't spam the controller
+// (the controller debounces rotation too, but we shouldn't fire hundreds of msgs).
+let _vpnLastEmit = Object.create(null);
+function emitVpnEvent(kind) {
+  try {
+    if (!VPN_CONTROLLER_ID) return;
+    const now = Date.now();
+    const minGap = (kind === 'idle') ? 0 : 15000; // idle must always land (run finished)
+    if (_vpnLastEmit[kind] && now - _vpnLastEmit[kind] < minGap) return;
+    _vpnLastEmit[kind] = now;
+    chrome.runtime.sendMessage(VPN_CONTROLLER_ID, { sgVpnEvent: kind }, () => {
+      // Controller not installed / not listening → lastError; expected, ignore.
+      void chrome.runtime.lastError;
+    });
+  } catch (_) {}
+}
+
 // ── v7.1.3: Extension integrity fingerprint ─────────────────────────────────
 // Self-hash this build's code (manifest + background + sidepanel) and present it
 // on every backend request. The server refuses data unless the hash is an
@@ -383,13 +414,32 @@ chrome.runtime.onConnect.addListener(port => {
   port.onDisconnect.addListener(() => _alivePorts.delete(port));
 });
 
+// ── v7.1.51: abnormal-behaviour detector ─────────────────────────────────────
+// A burst of unhandled errors in a short window means the service worker is
+// misbehaving (wedged event loop shedding rejections, a poisoned state, etc.).
+// Escalate to a self-heal reload — bounded by the storage-backed cooldown inside
+// requestSelfHealReload() so it can never boot-loop. Normal one-off rejections
+// (an aborted fetch here and there) never reach the threshold.
+let _swErrWindowStart = 0;
+let _swErrCount = 0;
+function _noteAbnormal() {
+  const now = Date.now();
+  if (!_swErrWindowStart || now - _swErrWindowStart > 60000) { _swErrWindowStart = now; _swErrCount = 0; }
+  if (++_swErrCount >= 10) {
+    _swErrCount = 0;
+    try { requestSelfHealReload('error-storm (10+ unhandled errors/min)'); } catch (_) {}
+  }
+}
+
 // Global unhandled rejection guard — prevents silent SW crashes
 self.addEventListener('unhandledrejection', e => {
   try { addLog('⚠️ Unhandled error: ' + (e.reason?.message || String(e.reason))); } catch (_) {}
+  try { _noteAbnormal(); } catch (_) {}
   e.preventDefault();
 });
 self.addEventListener('error', e => {
   try { addLog('⚠️ SW error: ' + (e.message || String(e))); } catch (_) {}
+  try { _noteAbnormal(); } catch (_) {}
 });
 
 // Close orphaned helper tabs from previous SW session before creating new ones
@@ -556,6 +606,9 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
     try {
       switch (msg.action) {
         case 'ping':           reply({ ok:true }); break;  // watchdog keepalive
+        // v7.1.51: content-script watchdog asks us to reload (it can't call
+        // chrome.runtime.reload() itself). Reply first — the reload tears down the SW.
+        case 'forceReload':    reply({ ok:true }); requestSelfHealReload(msg.reason || 'watchdog request'); break;
         // ── v2.0 handlers (unchanged) ──
         case 'start':          await doStart(msg);              reply({ ok:true }); break;
         case 'pause':          doPause();                       reply({ ok:true, paused:ST.paused }); break;
@@ -634,7 +687,7 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
           scrapeStopFlag = true; scrapePauseFlag = false;
           addLog('⏹ Keyword scraping stopped');
           ST.scrapeProgress.active = false;
-          if (!ST.running) setSgGuardCookie(false); // v7.1.39: release cleaner guard
+          if (!ST.running) { setSgGuardCookie(false); emitVpnEvent('idle'); } // v7.1.39/51: release cleaner + VPN
           disableAmazonScrapeMode().catch(() => {});
           broadcast();
           reply({ ok:true }); break;
@@ -991,7 +1044,7 @@ async function doStop()  {
   // resumes cookie/cache wiping immediately. Previously Stop left `sg_active` set
   // until its 180s TTL expired, so the cleaner stayed paused for up to 3 min after
   // the user stopped a run. Skip if a keyword scrape is still active (it owns the guard).
-  if (!ST.scrapeProgress.active) setSgGuardCookie(false);
+  if (!ST.scrapeProgress.active) { setSgGuardCookie(false); emitVpnEvent('idle'); } // v7.1.51: also release the VPN
   addLog('⛔ Stopped');
   await saveFullState_().catch(() => {}); // queue + idx must be persisted on stop
   broadcast();
@@ -1609,6 +1662,7 @@ function _amazonRatePenalty() {
   const prev = _amazonRatePerSec;
   _amazonRatePerSec = Math.max(AMAZON_RATE_MIN, _amazonRatePerSec / 2);
   if (_amazonRatePerSec !== prev) addLog(`  🐢 Amazon request rate ↓ ${(prev*60).toFixed(0)}→${(_amazonRatePerSec*60).toFixed(0)}/min (rate-limited)`);
+  emitVpnEvent('slow'); // v7.1.51: throttled by Amazon → rotate IP if already on VPN
   // v7.1.50: snapshot the backed-off controller state the moment we learn to slow
   // down, so an UNEXPECTED restart (watchdog crash-reload, MV3 kill) resumes on
   // this reduced rate instead of the aggressive 24/0.8 defaults and re-hammering
@@ -1667,6 +1721,7 @@ function _amazonFetchReward() {
     _amazonTabLimit = AMAZON_TAB_MAX;
     _amazonCleanStreak = 0;
     addLog(`  ⚡ Amazon back to fast mode (tabless pool healthy — human behaviour off)`);
+    emitVpnEvent('clean'); // v7.1.51: recovered from a block → let the controller arm disconnect
   }
 }
 
@@ -1991,6 +2046,7 @@ function _amazonWallStrike() {
     _wallBreakerUntil = Date.now() + WALL_BREAKER_REST_MS;
     addLog(`  🧊 Amazon wall is persistent (${_wallStrikes} consecutive blocks) — resting ALL Amazon tabs ${Math.round(WALL_BREAKER_REST_MS / 1000)}s so the rate limit clears. Blocked items are queued for auto-retry.`);
     rotateIdentityThrottled().catch(() => {}); // one fresh identity for the post-rest resume
+    emitVpnEvent('block'); // v7.1.51: persistent wall → ask the VPN controller to switch IP
     // v7.1.50: persist the open breaker so an unexpected restart during the rest
     // window keeps resting instead of resuming straight into the wall.
     _persistRuntimeState();
@@ -2041,6 +2097,7 @@ async function _recordAmazonCaptcha() {
   const cooldownMs = Math.min(5000 * Math.pow(2, _amazonCaptchaStreak - 1), 30000);
   _amazonCaptchaCooldownUntil = Date.now() + cooldownMs;
   addLog(`  🛑 Amazon CAPTCHA #${_amazonCaptchaStreak} — ${Math.ceil(cooldownMs / 1000)}s cooldown for all workers (rotating identity)`);
+  emitVpnEvent('block'); // v7.1.51: CAPTCHA = current IP is flagged → switch IP
   _amazonTabPenalty(); // v7.1.42: collapse recovery-tab limit to floor on any block
   
   // Rotate identity and nuke cookies to clear the CAPTCHA block.
@@ -2706,6 +2763,7 @@ async function processLoop() {
     if (s.silentFailures)     summary += ` · Silent failures: ${s.silentFailures}`;
     if (s.brandParseFailures) summary += ` · Parse failures: ${s.brandParseFailures}`;
     addLog('\n'+summary);
+    emitVpnEvent('idle'); // v7.1.51: run finished → tell the VPN controller to disconnect
     chrome.runtime.sendMessage({ type:'jobComplete', stats:s }).catch(()=>{});
     try { chrome.notifications.create({ type:'basic', iconUrl:'icons/icon48.png', title:'Brand Website Finder', message:summary }); } catch(_) {}
   }
@@ -4770,6 +4828,34 @@ async function _reloadNow() {
   catch (e) { _reloadPending = false; _reloadInFlight = false; noteSilentFailure('self-heal reload (main path) — service worker may now be stranded', e); }
 }
 
+// ── v7.1.51: unified self-heal reload entry point ────────────────────────────
+// Single funnel for every "reload the extension" trigger — the content-script
+// watchdog (dead/unresponsive SW), the error-storm detector (abnormal behaviour),
+// and the wedge health-check. A storage-backed cooldown makes it boot-loop-proof:
+// chrome.runtime.reload() restarts the SW and wipes in-memory guards, so the
+// last-reload timestamp MUST live in storage. If the extension is genuinely broken
+// it reloads at most once per cooldown instead of every 15s forever. When a job is
+// running we drain+persist via _reloadNow (no duplicate result rows); otherwise we
+// persist and reload straight away.
+const FORCED_RELOAD_COOLDOWN_MS = 90000;
+async function requestSelfHealReload(reason) {
+  const now = Date.now();
+  try {
+    const s = await chrome.storage.local.get('_lastForcedReloadAt');
+    if (s && s._lastForcedReloadAt && now - s._lastForcedReloadAt < FORCED_RELOAD_COOLDOWN_MS) return;
+    await chrome.storage.local.set({ _lastForcedReloadAt: now });
+  } catch (_) {}
+  try { addLog(`  🔄 Self-heal reload (${reason})`); } catch (_) {}
+  if (ST.running) {
+    _reloadNow(); // drains in-flight work, persists controller + queue, THEN reloads
+  } else {
+    try { await _persistRuntimeState(); } catch (_) {}
+    try { await saveFullState_(); } catch (_) {}
+    try { chrome.runtime.reload(); }
+    catch (e) { try { noteSilentFailure('requestSelfHealReload direct reload', e); } catch (_) {} }
+  }
+}
+
 // Debounced hot save — coalesces rapid per-item calls into one write every 2 s
 let _saveTimer = null;
 function saveStateDebounced() {
@@ -4855,7 +4941,7 @@ chrome.alarms.onAlarm.addListener(alarm => {
     _healthPrev = { idx, done };
     if (stalled) {
       addLog('  🩺 Run wedged — no progress for ~2 min. Self-heal reload to recover.');
-      _reloadNow();
+      requestSelfHealReload('run wedged — no forward progress ~2 min');
     }
     return;
   }
