@@ -987,6 +987,11 @@ async function doStop()  {
   _helperTabs.length = 0;
   _helperInitDone = false;
   chrome.storage.local.remove('_helperTabIds').catch(() => {});
+  // v7.1.51: release the scraper-guard cookie so the companion Auto-Clear extension
+  // resumes cookie/cache wiping immediately. Previously Stop left `sg_active` set
+  // until its 180s TTL expired, so the cleaner stayed paused for up to 3 min after
+  // the user stopped a run. Skip if a keyword scrape is still active (it owns the guard).
+  if (!ST.scrapeProgress.active) setSgGuardCookie(false);
   addLog('⛔ Stopped');
   await saveFullState_().catch(() => {}); // queue + idx must be persisted on stop
   broadcast();
@@ -1002,6 +1007,7 @@ async function doReset() {
 
   await disableTextOnlyMode().catch(() => {});
   await disableAmazonScrapeMode().catch(() => {});
+  if (!ST.scrapeProgress.active) setSgGuardCookie(false); // v7.1.51: don't leave the cleaner paused after a reset
   await chrome.storage.local.remove(['results','logs','engineBlockStatus','running','paused','queue','idx','stats','mode','_helperTabIds']).catch(() => {});
   addLog('🔄 Reset — paste ASINs or scrape Amazon'); broadcast();
 }
@@ -3666,11 +3672,17 @@ async function scrapeAmazonByKeywords(msg) {
   // Brief pause so sidepanel can render the ASINs before the run begins
   await sleep(150);
 
-  // Auto-start brand website finder immediately — minimum 10 tabs.
+  // Auto-start brand website finder immediately.
   // _autoHandoff skips the redundant freshStart() so the finder begins instantly.
-  const autoParallel = Math.max(10, getParallelTabs());
-  addLog(`   🚀 Starting Brand Website Finder automatically (${autoParallel} tabs)...`);
-  await doStart({ mode: ST.mode, cfg: { ...ST.cfg, parallelTabs: autoParallel }, _autoHandoff: true });
+  // v7.1.51: do NOT force a minimum of 10 tabs here. The old Math.max(10, …)
+  // overrode the user's "Tabs at once" setting AND persisted it into cfg, so a
+  // user who deliberately lowered concurrency to dodge Amazon blocks silently got
+  // slammed back up to 10 on every keyword-scrape handoff — re-introducing the
+  // exact block cascade the getWebsiteFindConcurrency 1–10 clamp was added to
+  // prevent. Pass cfg untouched; getWebsiteFindConcurrency() already defaults to
+  // 10 when parallelTabs is unset and honours the user's value (1–10) when set.
+  addLog(`   🚀 Starting Brand Website Finder automatically (${getWebsiteFindConcurrency()} tabs)...`);
+  await doStart({ mode: ST.mode, cfg: ST.cfg, _autoHandoff: true });
 }
 
 // Inject CSS immediately to suppress media rendering — page stays text-only and fast.
