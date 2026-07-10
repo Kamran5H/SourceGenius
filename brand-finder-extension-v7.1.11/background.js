@@ -1725,6 +1725,24 @@ function _amazonFetchReward() {
   }
 }
 
+// v7.1.51: reject brand candidates that are actually HTML/URL fragments. On
+// Amazon's "Continue shopping" interstitial and search/nav pages there is a
+// left-rail "Brand" FILTER facet whose links (e.g. `registry?ld=AZUSSOA_ABR-FT"
+// class="nav_a">…`) were being scraped as a brand by the loose `Brand:` regex —
+// a real brand name never contains markup, attributes, or a URL. Left unchecked
+// this junk brand got deduped, searched, and produced false website matches
+// (m.me, jane.biosemantics.org, …) that then polluted the shared team DB.
+function _looksLikeGarbageBrand(s) {
+  if (!s) return true;
+  // Punctuation that never appears in a real brand name but is all over markup/URLs.
+  // (Apostrophe/&/. are deliberately allowed: L'Oréal, Bath & Body Works, Amazon.)
+  if (/[<>"=?/\\{}|]/.test(s)) return true;
+  if (/\b(class|href|style|nav_|aria|data-)\b/i.test(s)) return true; // HTML attribute tokens
+  if (/https?:|:\/\/|&#|&[a-z]+;/i.test(s)) return true;              // URLs / leftover HTML entities
+  if (!/[A-Za-z]/.test(s)) return true;                              // must contain at least one letter
+  return false;
+}
+
 // Regex-parse Amazon product HTML (no DOM in the service worker).
 function _parseAmazonHtml(html, url) {
   const decode = (t) => (t || '')
@@ -1738,7 +1756,7 @@ function _parseAmazonHtml(html, url) {
     .replace(/\s+/g, ' ').trim();
 
   let brand = '';
-  const tryPat = (re) => { if (brand) return; const m = html.match(re); if (m && m[1]) { const c = clean(m[1]); if (c && c.length > 1 && c.length < 60) brand = c; } };
+  const tryPat = (re) => { if (brand) return; const m = html.match(re); if (m && m[1]) { const c = clean(m[1]); if (c && c.length > 1 && c.length < 60 && !_looksLikeGarbageBrand(c)) brand = c; } };
 
   // 1. JSON-LD / inline JSON brand + manufacturer (most reliable, in raw HTML)
   tryPat(/"brand"\s*:\s*\{[^}]*?"name"\s*:\s*"([^"]+)"/i);
@@ -1753,7 +1771,9 @@ function _parseAmazonHtml(html, url) {
   // 5. Detail-bullets / spec table "Brand: X"
   tryPat(/>\s*Brand\s*<\/span>\s*<span[^>]*>\s*([^<]+?)\s*</i);
   tryPat(/>\s*Brand\s*Name?\s*<\/t[hd]>\s*<td[^>]*>\s*([^<]+?)\s*</i);
-  tryPat(/Brand\s*[:\-]\s*([A-Za-z0-9][^<\n\r]{1,58})/i);
+  // v7.1.51: char class tightened from [^<\n\r] to [^<>"\n\r] so a match can never
+  // swallow attribute/markup punctuation (the interstitial "Brand" filter-facet bug).
+  tryPat(/Brand\s*[:\-]\s*([A-Za-z0-9][^<>"\n\r]{1,58})/i);
 
   let asin = ((url.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase();
   if (!asin) asin = ((html.match(/"asin"\s*:\s*"([A-Z0-9]{10})"/i) || [])[1] || '').toUpperCase();
@@ -1926,7 +1946,10 @@ async function fetchAmazonProductViaTab(url, timeout) {
           .replace(/\s*\((Author|Editor|Illustrator|Translator|Contributor|Narrator|Artist|Publisher)[^)]*\).*/i, '')
           .trim();
         let brand = '';
-        const pick = (v) => { if (brand) return; const c = clean(v); if (c && c.length > 1 && c.length < 60) brand = c; };
+        // v7.1.51: reject markup/URL fragments (mirrors _looksLikeGarbageBrand in the
+        // SW — can't be referenced here, this runs in the page, so it's inlined).
+        const garbage = (s) => !s || /[<>"=?/\\{}|]/.test(s) || /\b(class|href|style|nav_|aria|data-)\b/i.test(s) || /https?:|:\/\//i.test(s) || !/[A-Za-z]/.test(s);
+        const pick = (v) => { if (brand) return; const c = clean(v); if (c && c.length > 1 && c.length < 60 && !garbage(c)) brand = c; };
 
         const by = document.querySelector('#bylineInfo');
         if (by) pick(by.textContent);
