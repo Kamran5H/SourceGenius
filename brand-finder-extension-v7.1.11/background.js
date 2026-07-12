@@ -538,6 +538,7 @@ chrome.storage.local.get(['cfg','logs','logsTotal','results','userProfile','memb
     // wall-rest that a prompt restart must keep observing).
     const fresh = _runtimeSnapshotIsFresh(rs, Date.now());
     if (fresh && num(rs.rate))          _amazonRatePerSec    = clamp(rs.rate, AMAZON_RATE_MIN, AMAZON_RATE_MAX);
+    if (fresh && num(rs.rateCeil))      _amazonRateCeil      = clamp(rs.rateCeil, AMAZON_RATE_MIN, AMAZON_RATE_MAX); // v7.1.52
     if (fresh && num(rs.fetchLimit))    _amazonFetchLimit    = clamp(rs.fetchLimit, AMAZON_FETCH_MIN, AMAZON_FETCH_MAX);
     if (fresh && num(rs.wallStrikes))   _wallStrikes         = Math.max(0, rs.wallStrikes);
     if (fresh && num(rs.captchaStreak)) _amazonCaptchaStreak = Math.max(0, rs.captchaStreak);
@@ -939,6 +940,7 @@ async function doStart(msg) {
     // Always start fresh — no history, no cookies, no cached state from prior runs
     await freshStart();
     _autoRerunRound = 0; // v7.1.30: a brand-new user run resets the auto-rerun budget
+    _amazonRateCeil = AMAZON_RATE_MAX; _amazonRateCeilAt = 0; // v7.1.52: fresh run re-probes from the top
     chrome.runtime.sendMessage({ type: 'freshStart' }).catch(() => {});
   }
 
@@ -1633,6 +1635,17 @@ let   _amazonRateTokens    = AMAZON_RATE_BURST;
 let   _amazonRateLastRefill = Date.now();
 let   _amazonRateLastPenalty = 0;
 let   _amazonRateLastReward  = 0;   // v7.1.47: wall-clock throttle on the additive rate increase
+// ── v7.1.52: LEARNED rate ceiling — the fix for "always blocks on long runs" ──
+// The old reward always climbed _amazonRatePerSec back toward the FIXED
+// AMAZON_RATE_MAX (1.0). So on a 100k-ASIN run the controller looped forever:
+// block → halve → recover → climb back to 1.0 → block again. It never LEARNED
+// that this IP can't sustain 60/min. This ceiling ratchets DOWN every time the
+// wall breaker opens (a persistent-wall signal) and the reward can never exceed
+// it, so the run converges on a rate the IP actually tolerates instead of
+// re-provoking the same wall every 60–90s. It relaxes back up very slowly after
+// a long clean stretch, and resets to MAX on a fresh user run.
+let   _amazonRateCeil      = AMAZON_RATE_MAX; // per-run learned ceiling
+let   _amazonRateCeilAt    = 0;               // last time the ceiling moved
 
 function _refillAmazonRate() {
   const now = Date.now();
@@ -1679,10 +1692,18 @@ function _amazonRatePenalty() {
 // the block to actually clear before probing higher.
 function _amazonRateReward() {
   const now = Date.now();
+  // v7.1.52: relax the LEARNED ceiling back up only after a long clean stretch
+  // (15 min with no wall event), so a run that hit one rough patch early isn't
+  // stuck crawling for hours if Amazon later calms down — but it climbs back so
+  // slowly it can't re-provoke the wall the way the old instant re-accel did.
+  if (_amazonRateCeil < AMAZON_RATE_MAX && now - _amazonRateCeilAt > 900000) {
+    _amazonRateCeil = Math.min(AMAZON_RATE_MAX, _amazonRateCeil + 0.05);
+    _amazonRateCeilAt = now;
+  }
   if (now - _amazonRateLastReward < 5000) return;
   _amazonRateLastReward = now;
-  if (_amazonRatePerSec < AMAZON_RATE_MAX) {
-    _amazonRatePerSec = Math.min(AMAZON_RATE_MAX, _amazonRatePerSec + 0.05);
+  if (_amazonRatePerSec < _amazonRateCeil) {
+    _amazonRatePerSec = Math.min(_amazonRateCeil, _amazonRatePerSec + 0.05);
   }
 }
 
@@ -2068,6 +2089,15 @@ function _amazonWallStrike() {
   if (_wallStrikes >= WALL_BREAKER_STRIKES && Date.now() > _wallBreakerUntil) {
     _wallBreakerUntil = Date.now() + WALL_BREAKER_REST_MS;
     addLog(`  🧊 Amazon wall is persistent (${_wallStrikes} consecutive blocks) — resting ALL Amazon tabs ${Math.round(WALL_BREAKER_REST_MS / 1000)}s so the rate limit clears. Blocked items are queued for auto-retry.`);
+    // v7.1.52: a persistent wall means the current sustainable rate is still too
+    // high — ratchet the LEARNED ceiling down 30% (floor at the safe minimum) so
+    // the post-rest resume settles lower instead of climbing straight back into
+    // the same wall. Cap the current rate to the new ceiling immediately.
+    const _prevCeil = _amazonRateCeil;
+    _amazonRateCeil = Math.max(AMAZON_RATE_MIN, _amazonRateCeil * 0.7);
+    _amazonRateCeilAt = Date.now();
+    if (_amazonRatePerSec > _amazonRateCeil) _amazonRatePerSec = _amazonRateCeil;
+    if (_amazonRateCeil !== _prevCeil) addLog(`  ⬇️ Learned Amazon rate ceiling ↓ ${(_prevCeil*60).toFixed(0)}→${(_amazonRateCeil*60).toFixed(0)}/min — settling at a rate this IP tolerates`);
     rotateIdentityThrottled().catch(() => {}); // one fresh identity for the post-rest resume
     emitVpnEvent('block'); // v7.1.51: persistent wall → ask the VPN controller to switch IP
     // v7.1.50: persist the open breaker so an unexpected restart during the rest
@@ -4790,6 +4820,7 @@ async function _persistRuntimeState() {
     await chrome.storage.local.set({
       _sgRuntime: {
         rate:             _amazonRatePerSec,
+        rateCeil:         _amazonRateCeil,   // v7.1.52: preserve the learned ceiling across reloads
         fetchLimit:       _amazonFetchLimit,
         wallStrikes:      _wallStrikes,
         wallBreakerUntil: _wallBreakerUntil,
