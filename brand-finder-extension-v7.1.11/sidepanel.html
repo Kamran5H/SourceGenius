@@ -928,6 +928,16 @@ input#kw-file{display:none}
         <div style="font-size:9px;color:#6a7480;margin-top:1px">Concurrent workers (1–10). 🐢 Slow net / anti-CAPTCHA: 2–3 · ⚡ Fast: up to 10. Above 10 triggers Amazon CAPTCHAs — hard capped at 10.</div>
       </div>
 
+      <!-- Shared-connection instance count: divides this instance's Amazon
+           request-rate budget so N copies on ONE internet connection (same
+           public IP) collectively stay under Amazon's per-IP wall. -->
+      <div id="sg-shared-bar" style="margin:7px 0 2px">
+        <label style="font-size:11px;color:#8b949e;display:flex;align-items:center;gap:8px">📶 Copies on this wifi/IP
+          <input type="number" id="shared-instances" min="1" max="8" value="1" style="width:56px;text-align:center;background:#0d1117;color:#e6edf3;border:1px solid #30363d;border-radius:5px;padding:3px 4px;font-size:12px;font-weight:700;outline:none"/>
+        </label>
+        <div style="font-size:9px;color:#6a7480;margin-top:1px">Total Source Genius copies running on this SAME internet connection (all laptops/profiles). Each copy takes 1/N of the Amazon rate budget — 6 copies at full speed each = instant per-IP wall. Set the SAME number on every copy.</div>
+      </div>
+
       <!-- Input mode sub-tabs — v3: added Keywords tab -->
       <div class="itabs">
         <button class="itb on" data-ipane="paste">📋 Paste ASINs</button>

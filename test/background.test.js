@@ -338,3 +338,37 @@ test('loadPersistedResults: seeds bookkeeping so the first post-restore save is 
   const reloaded = await m2.loadPersistedResults({ resultsMeta: m2.store.resultsMeta });
   assert.equal(reloaded.length, 11001);
 });
+
+// ── Shared-connection rate sharing (6 copies on one wifi/IP) ────────────────
+function makeRateShareModule(cfg) {
+  const assembledRate = [
+    'const AMAZON_RATE_MIN = 0.35;',
+    'const AMAZON_RATE_MAX = 1.0;',
+    `let ST = { cfg: ${JSON.stringify(cfg || {})} };`,
+    extractFunction(src, '_rateShare'),
+    extractFunction(src, '_rateMin'),
+    extractFunction(src, '_rateMax'),
+    'module.exports = { ST, _rateShare, _rateMin, _rateMax };',
+  ].join('\n\n');
+  return compileModule(assembledRate, BG_PATH + '#rateshare');
+}
+
+test('_rateShare: defaults to 1 when unset, garbage, or below 1', () => {
+  assert.equal(makeRateShareModule({})._rateShare(), 1);
+  assert.equal(makeRateShareModule({ sharedInstances: 'abc' })._rateShare(), 1);
+  assert.equal(makeRateShareModule({ sharedInstances: 0 })._rateShare(), 1);
+  assert.equal(makeRateShareModule({ sharedInstances: -3 })._rateShare(), 1);
+});
+
+test('_rateShare: honours the configured copy count, capped at 8', () => {
+  assert.equal(makeRateShareModule({ sharedInstances: 6 })._rateShare(), 6);
+  assert.equal(makeRateShareModule({ sharedInstances: 99 })._rateShare(), 8);
+});
+
+test('_rateMin/_rateMax: 6 copies each get 1/6 of the per-IP budget (floor included)', () => {
+  const m = makeRateShareModule({ sharedInstances: 6 });
+  assert.equal(m._rateMax(), 1.0 / 6);   // ~10/min ceiling per copy → ~60/min aggregate
+  assert.equal(m._rateMin(), 0.35 / 6);  // ~3.5/min floor per copy → aggregate CAN now drop under the wall
+  // the old fixed floor: 6 copies × 21/min = 126/min aggregate — never clears
+  assert.ok(m._rateMin() * 6 * 60 < 22, 'shared floor aggregate must be far below the old 126/min');
+});

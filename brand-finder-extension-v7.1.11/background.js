@@ -544,8 +544,8 @@ chrome.storage.local.get(['cfg','logs','logsTotal','results','resultsMeta','user
     // inert once in the past, and honoured if still in the future (e.g. an open
     // wall-rest that a prompt restart must keep observing).
     const fresh = _runtimeSnapshotIsFresh(rs, Date.now());
-    if (fresh && num(rs.rate))          _amazonRatePerSec    = clamp(rs.rate, AMAZON_RATE_MIN, AMAZON_RATE_MAX);
-    if (fresh && num(rs.rateCeil))      _amazonRateCeil      = clamp(rs.rateCeil, AMAZON_RATE_MIN, AMAZON_RATE_MAX); // v7.1.52
+    if (fresh && num(rs.rate))          _amazonRatePerSec    = clamp(rs.rate, _rateMin(), _rateMax());
+    if (fresh && num(rs.rateCeil))      _amazonRateCeil      = clamp(rs.rateCeil, _rateMin(), _rateMax()); // v7.1.52
     if (fresh && num(rs.fetchLimit))    _amazonFetchLimit    = clamp(rs.fetchLimit, AMAZON_FETCH_MIN, AMAZON_FETCH_MAX);
     if (fresh && num(rs.wallStrikes))   _wallStrikes         = Math.max(0, rs.wallStrikes);
     if (fresh && num(rs.captchaStreak)) _amazonCaptchaStreak = Math.max(0, rs.captchaStreak);
@@ -948,7 +948,7 @@ async function doStart(msg) {
     // Always start fresh — no history, no cookies, no cached state from prior runs
     await freshStart();
     _autoRerunRound = 0; // v7.1.30: a brand-new user run resets the auto-rerun budget
-    _amazonRateCeil = AMAZON_RATE_MAX; _amazonRateCeilAt = 0; // v7.1.52: fresh run re-probes from the top
+    _amazonRateCeil = _rateMax(); _amazonRateCeilAt = 0; // v7.1.52: fresh run re-probes from the top (shared-IP budget applied)
     chrome.runtime.sendMessage({ type: 'freshStart' }).catch(() => {});
   }
 
@@ -1673,7 +1673,29 @@ let   _amazonRateLastReward  = 0;   // v7.1.47: wall-clock throttle on the addit
 let   _amazonRateCeil      = AMAZON_RATE_MAX; // per-run learned ceiling
 let   _amazonRateCeilAt    = 0;               // last time the ceiling moved
 
+// ── SHARED-CONNECTION RATE SHARING (the 6-copies-one-wifi fix) ───────────────
+// N copies of Source Genius on ONE public IP each ran their own independent
+// rate controller. Each targets up to AMAZON_RATE_MAX (60/min) and — worse —
+// has a hard FLOOR of AMAZON_RATE_MIN (21/min) it can never back off below.
+// 6 copies on the same wifi therefore could never drop the aggregate under
+// ~126/min, so Amazon's per-IP wall NEVER cleared regardless of how hard every
+// individual instance backed off — the run stayed pinned at the floor with
+// constant 🐢/🧊 lines. cfg.sharedInstances ("Copies on this wifi/IP" in the
+// panel) divides this instance's ceiling AND floor by N, so N copies together
+// behave like one well-paced client. Read live so a mid-run change applies.
+function _rateShare() {
+  const n = parseInt(ST.cfg && ST.cfg.sharedInstances, 10);
+  return (isFinite(n) && n >= 1) ? Math.min(8, n) : 1;
+}
+function _rateMin() { return AMAZON_RATE_MIN / _rateShare(); }
+function _rateMax() { return AMAZON_RATE_MAX / _rateShare(); }
+
 function _refillAmazonRate() {
+  // Live clamp: if the user raised "Copies on this wifi/IP" mid-run, pull the
+  // current rate + learned ceiling under the new shared budget immediately.
+  const max = _rateMax();
+  if (_amazonRateCeil > max)   _amazonRateCeil   = max;
+  if (_amazonRatePerSec > max) _amazonRatePerSec = max;
   const now = Date.now();
   const elapsed = (now - _amazonRateLastRefill) / 1000;
   if (elapsed > 0) {
@@ -1699,7 +1721,7 @@ function _amazonRatePenalty() {
   if (now - _amazonRateLastPenalty < 3000) return; // one cut per burst of blocks
   _amazonRateLastPenalty = now;
   const prev = _amazonRatePerSec;
-  _amazonRatePerSec = Math.max(AMAZON_RATE_MIN, _amazonRatePerSec / 2);
+  _amazonRatePerSec = Math.max(_rateMin(), _amazonRatePerSec / 2); // floor shares the per-IP budget across copies
   if (_amazonRatePerSec !== prev) addLog(`  🐢 Amazon request rate ↓ ${(prev*60).toFixed(0)}→${(_amazonRatePerSec*60).toFixed(0)}/min (rate-limited)`);
   emitVpnEvent('slow'); // v7.1.51: throttled by Amazon → rotate IP if already on VPN
   // v7.1.50: snapshot the backed-off controller state the moment we learn to slow
@@ -1722,8 +1744,8 @@ function _amazonRateReward() {
   // (15 min with no wall event), so a run that hit one rough patch early isn't
   // stuck crawling for hours if Amazon later calms down — but it climbs back so
   // slowly it can't re-provoke the wall the way the old instant re-accel did.
-  if (_amazonRateCeil < AMAZON_RATE_MAX && now - _amazonRateCeilAt > 900000) {
-    _amazonRateCeil = Math.min(AMAZON_RATE_MAX, _amazonRateCeil + 0.05);
+  if (_amazonRateCeil < _rateMax() && now - _amazonRateCeilAt > 900000) {
+    _amazonRateCeil = Math.min(_rateMax(), _amazonRateCeil + 0.05);
     _amazonRateCeilAt = now;
   }
   if (now - _amazonRateLastReward < 5000) return;
@@ -2120,7 +2142,7 @@ function _amazonWallStrike() {
     // the post-rest resume settles lower instead of climbing straight back into
     // the same wall. Cap the current rate to the new ceiling immediately.
     const _prevCeil = _amazonRateCeil;
-    _amazonRateCeil = Math.max(AMAZON_RATE_MIN, _amazonRateCeil * 0.7);
+    _amazonRateCeil = Math.max(_rateMin(), _amazonRateCeil * 0.7); // floor shares the per-IP budget across copies
     _amazonRateCeilAt = Date.now();
     if (_amazonRatePerSec > _amazonRateCeil) _amazonRatePerSec = _amazonRateCeil;
     if (_amazonRateCeil !== _prevCeil) addLog(`  ⬇️ Learned Amazon rate ceiling ↓ ${(_prevCeil*60).toFixed(0)}→${(_amazonRateCeil*60).toFixed(0)}/min — settling at a rate this IP tolerates`);

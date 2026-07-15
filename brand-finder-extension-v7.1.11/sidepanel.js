@@ -794,6 +794,8 @@ function loadCfg() {
     if ($('c-lwf') && r.cfg.liveWriteFilter) $('c-lwf').value = r.cfg.liveWriteFilter;
     // v7.1.15: reflect the saved "tabs at once" value in the slider + number box
     if (typeof _setParTabsUI === 'function') _setParTabsUI(r.cfg.parallelTabs != null ? r.cfg.parallelTabs : 20);
+    // Shared-connection instance count (copies on the same public IP)
+    if ($('shared-instances')) $('shared-instances').value = Math.max(1, Math.min(8, parseInt(r.cfg.sharedInstances, 10) || 1));
   });
 }
 
@@ -817,6 +819,7 @@ function getCfg() {
     workMode:           currentWorkMode,
     captchaWait:        parseInt($('captcha-wait-slider')?.value) || 90,
     parallelTabs:       _clampTabs($('partabs-num')?.value || 20),  // v7.1.15
+    sharedInstances:    Math.max(1, Math.min(8, parseInt($('shared-instances')?.value, 10) || 1)), // copies on same IP
     fallbackSearch:     fb,
     autoDeleteNotFound: $('c-autodel-notfound')?.checked || false,
     apolloApiKey:       $('apollo-key')?.value.trim() || '',
@@ -5784,7 +5787,6 @@ function _saveParTabs(v) {
 
 function initParallelTabs() {
   const rng = $('partabs-range'), num = $('partabs-num');
-  if (!rng && !num) return;
   if (rng) {
     rng.addEventListener('input',  e => { if (num) num.value = _clampTabs(e.target.value); });
     rng.addEventListener('change', e => _saveParTabs(e.target.value));
@@ -5792,5 +5794,15 @@ function initParallelTabs() {
   if (num) {
     num.addEventListener('input',  e => { if (rng) rng.value = _clampTabs(e.target.value); });
     num.addEventListener('change', e => _saveParTabs(e.target.value));
+  }
+  // Shared-connection instance count — saves immediately on change so the
+  // background's rate limiter picks it up live (mid-run included).
+  const shared = $('shared-instances');
+  if (shared) {
+    shared.addEventListener('change', e => {
+      const v = Math.max(1, Math.min(8, parseInt(e.target.value, 10) || 1));
+      e.target.value = v;
+      try { chrome.runtime.sendMessage({ action:'saveConfig', cfg:{ sharedInstances: v } }, () => {}); } catch (_) {}
+    });
   }
 }
