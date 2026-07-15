@@ -472,7 +472,7 @@ chrome.storage.local.get(['_sgManagedTabIds'], (result) => {
   }
 });
 
-chrome.storage.local.get(['cfg','logs','logsTotal','results','userProfile','memberStatus','v58session', 'engineBlockStatus', 'running', 'paused', 'queue', 'idx', 'stats', 'mode', 'brandWebsiteCache', '_sgRuntime'], r => {
+chrome.storage.local.get(['cfg','logs','logsTotal','results','resultsMeta','userProfile','memberStatus','v58session', 'engineBlockStatus', 'running', 'paused', 'queue', 'idx', 'stats', 'mode', 'brandWebsiteCache', '_sgRuntime'], async r => {
   // v7.1.35: same defensive guard — see comment above.
   if (chrome.runtime.lastError || !r) return;
   if (r.cfg)          ST.cfg       = { ...ST.cfg, ...r.cfg };
@@ -480,7 +480,14 @@ chrome.storage.local.get(['cfg','logs','logsTotal','results','userProfile','memb
     try { brandWebsiteCache = new Map(Object.entries(r.brandWebsiteCache)); } catch(_) {}
   }
   if (r.logs)         LOGS         = r.logs.slice(-300);
-  if (r.results)      ST.results   = r.results;
+  // AUDIT-FIX (100K scale): results now restore from the chunked layout
+  // (resultsMeta + resultsChunk_N), falling back to the legacy 'results' key.
+  try {
+    const loaded = await loadPersistedResults(r);
+    if (loaded) { ST.results = loaded; _persistedResultsRef = ST.results; }
+  } catch (_) {
+    if (r.results) ST.results = r.results;
+  }
   // AUDIT-FIX: a revived service worker starts _broadcastResultsLen at 0, so its
   // first broadcast() resent the ENTIRE results array as a "delta". An already-open
   // sidepanel (renderedN persisted) then appended every prior row a second time —
@@ -916,6 +923,7 @@ async function freshStart() {
   await nukeTrackingCookies().catch(() => {});
 
   // Purge persisted scraping state from storage (keep auth, cfg, user profile)
+  await clearPersistedResults().catch(() => {}); // AUDIT-FIX: also drop chunked results
   await chrome.storage.local.remove([
     'results', 'logs', 'running', 'paused', 'queue', 'idx', 'stats', 'engineBlockStatus',
     '_helperTabIds',
@@ -1063,6 +1071,7 @@ async function doReset() {
   await disableTextOnlyMode().catch(() => {});
   await disableAmazonScrapeMode().catch(() => {});
   if (!ST.scrapeProgress.active) setSgGuardCookie(false); // v7.1.51: don't leave the cleaner paused after a reset
+  await clearPersistedResults().catch(() => {}); // AUDIT-FIX: also drop chunked results
   await chrome.storage.local.remove(['results','logs','engineBlockStatus','running','paused','queue','idx','stats','mode','_helperTabIds']).catch(() => {});
   addLog('🔄 Reset — paste ASINs or scrape Amazon'); broadcast();
 }
@@ -1084,6 +1093,7 @@ async function doSaveProfile(profile) {
 function buildStatus() {
   return { running:ST.running, paused:ST.paused, mode:ST.mode,
            stats:ST.stats, idx:ST.idx, qLen:ST.queue.length,
+           resultsLen:ST.results.length, // AUDIT-FIX: lets the panel skip full getResults fetches when nothing changed
            logs:LOGS.slice(-80), logsTotal:LOGS.length, current:ST.queue[ST.idx]||null,
            cfg:ST.cfg, scrapeProgress:ST.scrapeProgress,
            userProfile, memberStatus, memberHideWebsites,
@@ -2721,12 +2731,19 @@ async function processLoop() {
     if (!ST.running) break;
 
     for (const item of retryItems) {
-      ST.queue.push({ asin: item.asin, url: item.url, raw: item.raw, brandHint: item.brandHint });
+      // AUDIT-FIX: idx was missing here — retried rows rendered as "NaN" in the
+      // sidepanel's # column (every other queue-builder sets idx).
+      ST.queue.push({ idx: ST.queue.length, asin: item.asin, url: item.url, raw: item.raw, brandHint: item.brandHint });
       if (item.status === 'error')   ST.stats.errors   = Math.max(0, ST.stats.errors   - 1);
       if (item.status === 'skipped') ST.stats.notFound  = Math.max(0, ST.stats.notFound  - 1);
     }
     // Drop the old failed results + roll back the done counter for the re-queued items
     ST.results = ST.results.filter(r => !isRetryable(r));
+    // AUDIT-FIX: results just SHRANK in place while the run is live. The broadcast
+    // delta cursor still pointed at the old (larger) length, so rows committed
+    // right after this filter were sliced past and never reached the panel — the
+    // table visibly dropped/duplicated rows during retry rounds. Resync it.
+    _broadcastResultsLen = ST.results.length;
     ST.stats.done -= retryItems.length;
     broadcast();
 
@@ -2791,6 +2808,7 @@ async function processLoop() {
       const removed = before - ST.results.length;
       if (removed > 0) {
         addLog(`🗑 Auto-removed ${removed} duplicate/DB-duplicate entr${removed===1?'y':'ies'} from results`);
+        _broadcastResultsLen = ST.results.length; // results shrank — resync delta cursor
         await saveState_(); // results-only write is fine here
       }
       // Also clean live-write sheet if it is deployed with the user-livewrite.gs script
@@ -2846,8 +2864,7 @@ async function maybeAutoRerunSkipped() {
   const RETRY = new Set(['skipped', 'not-found', 'error']);
   const failed = (ST.results || []).filter(r => RETRY.has(r.status));
 
-  const stored = await chrome.storage.local.get('skippedBank').catch(() => ({}));
-  const bank = stored.skippedBank || {};
+  const bank = await _getSkippedBank(); // in-memory bank — includes not-yet-flushed skips
   const inResults = new Set(failed.map(r => r.asin || extractAsin(r.url || r.raw) || (r.url || r.raw)));
   for (const [key, entry] of Object.entries(bank)) {
     if (!inResults.has(key)) failed.push({ url: entry.url, raw: entry.raw, asin: entry.asin, brandHint: entry.brandHint, status: 'skipped' });
@@ -2899,7 +2916,10 @@ async function maybeAutoRerunSkipped() {
   ST.idx   = 0;
   ST.stats = { total: queue.length, done: 0, found: 0, notFound: 0, errors: 0, dupes: 0, dbDupes: 0 };
   processedBrands.clear(); processedWebsites.clear();
-  await chrome.storage.local.set({ results: ST.results }).catch(() => {});
+  // AUDIT-FIX: results just shrank in place — reset the broadcast delta cursor so
+  // the next broadcast doesn't skip newly-committed rows, and persist chunked.
+  _broadcastResultsLen = ST.results.length;
+  await persistResults().catch(() => {});
 
   addLog(`🔁 Auto-rerun round ${_autoRerunRound}/${maxRounds}: re-running ${queue.length} ASIN${queue.length > 1 ? 's' : ''} from the start…`);
   chrome.runtime.sendMessage({ type: 'populateQueue', text: queue.map(q => q.url).join('\n'), count: queue.length }).catch(() => {});
@@ -3861,30 +3881,58 @@ async function retryNotFound() {
   ST.stats   = { total:ST.queue.length, done:0, found:0, notFound:0, errors:0, dupes:0, dbDupes:0 };
   processedBrands.clear(); processedWebsites.clear();
   addLog(`🔄 Retry queue loaded: ${ST.queue.length} not-found brand${ST.queue.length>1?'s':''} — click ▶ Start`);
-  await chrome.storage.local.set({ results:ST.results });
+  _broadcastResultsLen = ST.results.length; // results shrank — resync delta cursor
+  await persistResults().catch(() => {});
   broadcast();
 }
 
 // ── Skipped Bank ───────────────────────────────────────────────
 // Persists across freshStart() so ASINs skipped in any previous run
 // are still available when the user clicks "Re-run Skipped".
+// AUDIT-FIX (concurrency + scale): addToSkippedBank used to do a full storage
+// read-modify-write of the WHOLE bank per skipped item. With 10 concurrent
+// workers, two overlapping calls each read the same snapshot and the later
+// set() silently dropped the other's entry (lost skips). And on runs with
+// thousands of skips it re-serialized an ever-growing object once per skip.
+// Now: one shared in-memory bank (single-threaded JS makes mutations atomic),
+// flushed to storage on a 2s debounce, with a hard size cap so the bank can't
+// grow without bound across months of runs.
+const SKIPPED_BANK_MAX = 50000;
+let _skippedBankMem = null;
+let _skippedBankSaveTimer = null;
+async function _getSkippedBank() {
+  if (_skippedBankMem) return _skippedBankMem;
+  const stored = await chrome.storage.local.get('skippedBank').catch(() => ({}));
+  // Another caller may have initialized it while we awaited — never clobber.
+  if (!_skippedBankMem) _skippedBankMem = (stored && stored.skippedBank) || {};
+  return _skippedBankMem;
+}
+function _saveSkippedBankSoon() {
+  if (_skippedBankSaveTimer) return;
+  _skippedBankSaveTimer = setTimeout(() => {
+    _skippedBankSaveTimer = null;
+    if (_skippedBankMem) chrome.storage.local.set({ skippedBank: _skippedBankMem }).catch(() => {});
+  }, 2000);
+}
 async function addToSkippedBank(res) {
   const url = res.url || res.raw;
   if (!url) return;
   const asin = res.asin || extractAsin(url);
   const key  = asin || url;
-  const stored = await chrome.storage.local.get('skippedBank').catch(() => ({}));
-  const bank = stored.skippedBank || {};
+  const bank = await _getSkippedBank();
+  if (!(key in bank)) {
+    const keys = Object.keys(bank);
+    if (keys.length >= SKIPPED_BANK_MAX) delete bank[keys[0]]; // evict oldest entry
+  }
   bank[key] = { url, asin, raw: res.raw || url, brandHint: res.brandHint || '' };
-  await chrome.storage.local.set({ skippedBank: bank }).catch(() => {});
+  _saveSkippedBankSoon();
 }
 
 async function removeFromSkippedBank(keys) {
   if (!keys.length) return;
-  const stored = await chrome.storage.local.get('skippedBank').catch(() => ({}));
-  const bank = stored.skippedBank || {};
+  const bank = await _getSkippedBank();
   for (const k of keys) delete bank[k];
-  await chrome.storage.local.set({ skippedBank: bank }).catch(() => {});
+  _saveSkippedBankSoon();
 }
 
 // v7.1.23: Re-run every ASIN that was wasted by a skip / not-found / error.
@@ -3900,8 +3948,7 @@ async function retrySkipped() {
   const failed = (ST.results || []).filter(r => RETRY.has(r.status));
 
   // Merge in anything from the persistent bank not already in failed
-  const stored = await chrome.storage.local.get('skippedBank').catch(() => ({}));
-  const bank = stored.skippedBank || {};
+  const bank = await _getSkippedBank(); // in-memory bank — includes not-yet-flushed skips
   const inResults = new Set(failed.map(r => r.asin || extractAsin(r.url || r.raw) || (r.url || r.raw)));
   for (const [key, entry] of Object.entries(bank)) {
     if (!inResults.has(key)) failed.push({ url: entry.url, raw: entry.raw, asin: entry.asin, brandHint: entry.brandHint, status: 'skipped' });
@@ -3936,7 +3983,8 @@ async function retrySkipped() {
   ST.idx   = 0;
   ST.stats = { total: queue.length, done: 0, found: 0, notFound: 0, errors: 0, dupes: 0, dbDupes: 0 };
   processedBrands.clear(); processedWebsites.clear(); // run truly from the start
-  await chrome.storage.local.set({ results: ST.results }).catch(() => {});
+  _broadcastResultsLen = ST.results.length; // results shrank — resync delta cursor
+  await persistResults().catch(() => {});
 
   addLog(`🔁 Re-running ${queue.length} skipped/failed ASIN${queue.length > 1 ? 's' : ''} from the start…`);
   chrome.runtime.sendMessage({ type: 'populateQueue', text: queue.map(q => q.url).join('\n'), count: queue.length }).catch(() => {});
@@ -4369,6 +4417,7 @@ async function pushToDatabase(res) {
     ST.stats.notFound = (ST.stats.notFound || 0) + 1;
     res.status = 'not-found';
     res.notes  = r.message || 'Rejected — not an official brand website';
+    markResultChunkDirty(res); // in-place mutation of a committed row — persist its chunk
     saveStateDebounced();
     broadcast();
   }
@@ -4395,6 +4444,7 @@ function markAsDbDuplicate(res, reason) {
       ? 'Already in shared database (claimed concurrently)'
       : 'Already in shared database (found by another member first)';
     ST.stats.dbDupes = (ST.stats.dbDupes || 0) + 1;
+    markResultChunkDirty(res); // in-place mutation of a committed row — persist its chunk
     saveStateDebounced();
     broadcast();
   } catch (_) { /* never break the write path */ }
@@ -4607,12 +4657,15 @@ async function syncDbDuplicates() {
   for (const res of ST.results) {
     if (res.status === 'found') {
       const brandCheck = await checkDatabaseDuplicate(res.brand, null);
-      const wsCheck    = res.website ? await checkDatabaseDuplicate(null, res.website) : { isDuplicate:false };
+      // AUDIT-FIX (scale): the website check only matters when the brand check
+      // missed — short-circuiting halves the serial network calls on big syncs.
+      const wsCheck    = (!brandCheck.isDuplicate && res.website) ? await checkDatabaseDuplicate(null, res.website) : { isDuplicate:false };
       if (brandCheck.isDuplicate || wsCheck.isDuplicate) {
         res.status = 'db-duplicate';
         res.notes  = brandCheck.isDuplicate ? `Brand in DB (${brandCheck.matchField})` : 'Website in DB';
         ST.stats.found    = Math.max(0, ST.stats.found - 1);
         ST.stats.dbDupes  = (ST.stats.dbDupes||0) + 1;
+        markResultChunkDirty(res); // in-place mutation — persist its chunk
         relabelled++;
       }
     }
@@ -4682,8 +4735,19 @@ function buildQueueCsv() {
   if (!ST.queue.length) return null;
   const esc = v => '"'+String(v||'').replace(/"/g,'""')+'"';
   const hdr = ['#','Brand Name','ASIN','Amazon URL','Status','Official Website'];
+  // AUDIT-FIX (100K scale): was ST.results.find() inside the queue map — an
+  // O(queue × results) scan. At 100K ASINs that's ~10^10 comparisons, which
+  // hard-froze the service worker the moment "Download Queue" was clicked on a
+  // big run. Index results once (first match wins, same as .find()), then each
+  // queue row is an O(1) lookup.
+  const byKey = new Map();
+  for (const r of ST.results) {
+    for (const k of [r.asin, r.raw, r.url]) {
+      if (k && !byKey.has(k)) byKey.set(k, r);
+    }
+  }
   const rows = ST.queue.map((item, i) => {
-    const found  = ST.results.find(r => r.asin === item.asin || r.raw === item.raw || r.url === item.url);
+    const found  = (item.asin && byKey.get(item.asin)) || (item.raw && byKey.get(item.raw)) || (item.url && byKey.get(item.url)) || null;
     const brand  = found?.brand  || item.brandHint || '';
     const site   = found?.website || '';
     const status = found ? found.status : (i < ST.idx ? 'processed' : i === ST.idx ? 'current' : 'queued');
@@ -4755,19 +4819,125 @@ async function getPlansRemote() {
   catch(e) { return { plans:{}, error:e.message }; }
 }
 
+// ── AUDIT-FIX (100K scale): CHUNKED results persistence ─────────────────────
+// The old saveState_/saveFullState_ re-serialized the ENTIRE results array into
+// a single storage key on every hot save (2s debounce + every 5th item). At
+// 100K ASINs that is a multi-MB JSON.stringify with a transient memory spike on
+// EVERY save — the primary "100K runs stall/crash the service worker" cause.
+// Worse, the hot save's slice(-25000) CLOBBERED the full set saveFullState_ had
+// written, so any MV3 kill on a >25K-row run silently lost everything before
+// the last 25000. Results now persist in fixed 5000-row chunks: a run appends,
+// so all earlier chunks are already persisted and each hot save rewrites ONLY
+// the last partial chunk (≤5000 rows) — bounded work no matter how big the run
+// gets, and nothing is ever truncated. In-place status reclassifications
+// (db-dupe/rejected) mark their chunk dirty so the change still persists.
+// (comments above each declaration — test/_extract.js needs the line to end in ";")
+const RESULTS_CHUNK_SIZE = 5000;
+// per-chunk item count already persisted
+let _persistedChunkLens = [];
+// chunks with in-place mutations
+const _dirtyResultChunks = new Set();
+// detects wholesale ST.results reassignment
+let _persistedResultsRef = null;
+// chunk count currently in storage
+let _storedChunkCount = 0;
+// one-shot removal of the old monolithic key
+let _legacyResultsKeyCleared = false;
+
+function markResultChunkDirty(res) {
+  try {
+    const i = ST.results.indexOf(res);
+    if (i >= 0) _dirtyResultChunks.add(Math.floor(i / RESULTS_CHUNK_SIZE));
+  } catch (_) {}
+}
+
+async function _persistResultsOnce() {
+  const arr = ST.results;
+  if (_persistedResultsRef !== arr) {
+    // Array replaced wholesale (fresh run, retry-round filter, delete action…)
+    // → chunk bookkeeping is stale; rewrite everything.
+    _persistedChunkLens = [];
+    _dirtyResultChunks.clear();
+    _persistedResultsRef = arr;
+  }
+  const n = arr.length;
+  const chunkCount = Math.max(1, Math.ceil(n / RESULTS_CHUNK_SIZE));
+  const payload = { resultsMeta: { len: n, chunks: chunkCount, chunkSize: RESULTS_CHUNK_SIZE } };
+  const written = [];
+  for (let c = 0; c < chunkCount; c++) {
+    const start = c * RESULTS_CHUNK_SIZE;
+    const clen = Math.min(RESULTS_CHUNK_SIZE, n - start);
+    if (_persistedChunkLens[c] === clen && !_dirtyResultChunks.has(c)) continue;
+    payload['resultsChunk_' + c] = arr.slice(start, start + clen);
+    written.push([c, clen]);
+  }
+  await chrome.storage.local.set(payload);
+  // Commit bookkeeping only AFTER the write succeeded — a failed set() leaves
+  // the chunk marked unpersisted/dirty so the next save retries it.
+  for (const [c, clen] of written) { _persistedChunkLens[c] = clen; _dirtyResultChunks.delete(c); }
+  const stale = [];
+  for (let c = chunkCount; c < Math.max(_storedChunkCount, _persistedChunkLens.length); c++) stale.push('resultsChunk_' + c);
+  if (_persistedChunkLens.length > chunkCount) _persistedChunkLens.length = chunkCount;
+  _storedChunkCount = chunkCount;
+  if (!_legacyResultsKeyCleared) { _legacyResultsKeyCleared = true; stale.push('results'); }
+  if (stale.length) chrome.storage.local.remove(stale).catch(() => {});
+}
+
+// Serialized via a promise chain so overlapping callers (worker debounce +
+// saveFullState_ before a self-heal reload) can each await durable completion
+// in order — a reload never fires before its own write landed.
+let _persistResultsChain = Promise.resolve();
+function persistResults() {
+  _persistResultsChain = _persistResultsChain.catch(() => {}).then(() => _persistResultsOnce());
+  return _persistResultsChain;
+}
+
+// Reads results back: chunked layout first, legacy monolithic key as fallback
+// (so an update over an old install restores the previous run losslessly).
+async function loadPersistedResults(r) {
+  const meta = r && r.resultsMeta;
+  if (!meta || !isFinite(meta.chunks) || meta.chunks < 1) return (r && r.results) || null;
+  const keys = [];
+  for (let c = 0; c < meta.chunks; c++) keys.push('resultsChunk_' + c);
+  const s = await chrome.storage.local.get(keys);
+  const out = [];
+  const lens = [];
+  for (let c = 0; c < meta.chunks; c++) {
+    const part = s['resultsChunk_' + c];
+    lens[c] = Array.isArray(part) ? part.length : 0;
+    if (Array.isArray(part)) for (const it of part) out.push(it);
+  }
+  _storedChunkCount = meta.chunks;
+  // Seed the persist bookkeeping with what is ALREADY in storage, so the first
+  // save after a restore only touches the chunks that actually change instead
+  // of doing one giant full rewrite (self-heal reloads restore mid-run often).
+  _persistedChunkLens = lens;
+  _dirtyResultChunks.clear();
+  return out;
+}
+
+async function clearPersistedResults() {
+  const keys = ['results', 'resultsMeta'];
+  let n = Math.max(_storedChunkCount, _persistedChunkLens.length);
+  if (!n) {
+    try { const s = await chrome.storage.local.get('resultsMeta'); n = (s.resultsMeta && s.resultsMeta.chunks) || 0; } catch (_) {}
+  }
+  for (let c = 0; c < n; c++) keys.push('resultsChunk_' + c);
+  _persistedChunkLens = [];
+  _dirtyResultChunks.clear();
+  _persistedResultsRef = null;
+  _storedChunkCount = 0;
+  await chrome.storage.local.remove(keys);
+}
+
 /** Persist results to storage */
 async function saveState_() {
   // Split into two writes: hot data (results + logs, written frequently) and
   // cold data (queue, written only on structural changes). This prevents the
   // full queue (potentially thousands of items) from being serialized on every
   // per-item debounce, which was the primary I/O bottleneck during active runs.
+  await persistResults(); // chunked: rewrites only the last/dirty chunk(s)
   await chrome.storage.local.set({
-    // AUDIT-FIX (data loss): cap raised 2000→25000. On any SW suspension/revival
-    // mid-run the restore path does `ST.results = r.results`, so the old 2000-cap
-    // silently dropped every result before the last 2000 on runs bigger than that —
-    // gone from the table AND the CSV (buildCsv reads ST.results). 25000 covers
-    // realistic multi-thousand runs; saveFullState_ persists the full set uncapped.
-    results: ST.results.slice(-25000),
     logs: LOGS.slice(-300),
     logsTotal: LOGS.length,
     running: ST.running,
@@ -4780,12 +4950,8 @@ async function saveState_() {
 
 /** Persist queue + full state (call on start/stop/pause, not per-item) */
 async function saveFullState_() {
+  await persistResults(); // full results, chunked, no cap
   await chrome.storage.local.set({
-    // AUDIT-FIX (data loss): full results, no cap. saveFullState_ runs on
-    // start/stop/pause/finalize AND before every bwf-periodic-reload (which
-    // restarts the SW ~every 10 min mid-run), so truncating here permanently lost
-    // earlier results on large runs. unlimitedStorage is granted in the manifest.
-    results: ST.results,
     logs: LOGS.slice(-300),
     running: ST.running,
     paused: ST.paused,
@@ -4838,6 +5004,9 @@ async function _persistRuntimeState() {
       // Every Amazon tab currently open under our control — swept closed on restart.
       _sgManagedTabIds: [..._managedTabs, ..._helperTabs.map(t => t.tabId)],
     });
+    // AUDIT-FIX: flush the debounced skipped-bank too — a self-heal reload inside
+    // the 2s debounce window must not lose freshly-banked skips.
+    if (_skippedBankMem) await chrome.storage.local.set({ skippedBank: _skippedBankMem }).catch(() => {});
   } catch (_) {}
 }
 
@@ -7664,9 +7833,18 @@ async function openStealthTab(url, timeout) {
     throw new Error('Domain blocked — too many failed attempts this session');
   }
 
-  // Rotate to a fresh identity before each stealth tab
-  await rotateNetworkIdentity().catch(() => {});
-  await nukeTrackingCookies().catch(() => {});
+  // Rotate to a fresh identity before each stealth tab.
+  // AUDIT-FIX: the rotation is GLOBAL (the DNR UA rules apply to EVERY in-flight
+  // request, including concurrent Amazon fetches on the shared session). Rotating
+  // unconditionally per stealth tab recreated the exact per-worker-rotation
+  // cascade v7.1.44 fixed for Amazon — a mid-run UA flip under an unchanged
+  // session-id is an instant bot flag. Share the same 25s global rotation clock.
+  const _nowRot = Date.now();
+  if (_nowRot - _lastIdentityRotateAt >= 25000) {
+    _lastIdentityRotateAt = _nowRot;
+    await rotateNetworkIdentity().catch(() => {});
+    await nukeTrackingCookies().catch(() => {});
+  }
 
   // Add random pre-tab delay (mimics human think time between clicks)
   // CHECK(periodic): Tune this range based on detection rates

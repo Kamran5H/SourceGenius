@@ -896,11 +896,17 @@ function poll() {
     _bgFailCount = 0;
     applyStatus(r);
     _setAdaptivePollRate(r.running && !r.paused);
+    // AUDIT-FIX (100K scale): only refetch results when the background actually has
+    // a different count than we've rendered. The old unconditional getResults on
+    // every idle poll made the SW serialize the ENTIRE results array (up to 100K
+    // rows, tens of MB) over the message channel every 2 seconds FOREVER after a
+    // big run finished — pegging the SW and janking the panel while idle.
+    const wantResults = !(r.running && !r.paused) &&
+      (typeof r.resultsLen !== 'number' || r.resultsLen !== renderedN);
+    if (wantResults) {
+      chrome.runtime.sendMessage({ action:'getResults' }, res => { if (res?.results) renderResults(res.results); });
+    }
   });
-  // Only fetch results separately when not already receiving them via push
-  if (!_pollRunning) {
-    chrome.runtime.sendMessage({ action:'getResults' }, r => { if (r?.results) renderResults(r.results); });
-  }
 }
 
 chrome.runtime.onMessage.addListener(msg => {
@@ -1226,7 +1232,11 @@ function renderResults(results) {
   }
   if (results.length === renderedN) return;
   const tbody = $('rbody');
-  results.slice(renderedN).forEach(r => {
+  // AUDIT-FIX (100K scale): never build more <tr> nodes than the table keeps.
+  // A first render after a 100K run used to create 100,000 rows in one pass and
+  // then trim to 500 — a multi-second panel freeze. Start at the tail directly.
+  const startAt = Math.max(renderedN, results.length - MAX_RESULT_ROWS);
+  results.slice(startAt).forEach(r => {
     const tr = document.createElement('tr');
     const conf = r.conf > 0
       ? `<span style="font-size:10px;color:var(--muted)">${r.conf}%</span><span class="conf-bar" style="width:${Math.min(r.conf,100)*.35}px"></span>`
@@ -1257,9 +1267,14 @@ function renderResults(results) {
 // Append only new results from a broadcast delta (avoids re-serializing full array)
 function appendResults(newItems, totalLen) {
   if (!newItems?.length) return;
-  // If remote says total shrank (e.g. auto-remove ran), fall back to full re-render
+  // AUDIT-FIX: if the background's total shrank (retry round / auto-remove filtered
+  // results mid-run), appending only this delta after clearing left the table with
+  // just a handful of rows out of hundreds. Do a full resync instead — the delta
+  // items are included in the refetched set.
   if (totalLen > 0 && totalLen < renderedN) {
     renderedN = 0; $('rbody').innerHTML = '';
+    chrome.runtime.sendMessage({ action:'getResults' }, res => { if (res?.results) renderResults(res.results); });
+    return;
   }
   const tbody = $('rbody');
   newItems.forEach(r => {
@@ -1645,31 +1660,32 @@ function pollTeamStats(callback) {
 }
 
 function _pollTeamStatsWithRetry(attemptsLeft, callback) {
+  // AUDIT-FIX: callback used to fire even when a retry was still scheduled, which
+  // cleared _teamStatsInFlight while the retried getTeamStats chain was live —
+  // the 5s team-tab poll then started ANOTHER chain, stacking the exact 60s
+  // backend calls the in-flight guard exists to prevent. The callback (which
+  // releases the guard) now fires only when the chain truly ends.
+  const retry = () => setTimeout(() => _pollTeamStatsWithRetry(attemptsLeft - 1, callback), 2000);
+  const done  = () => { if (callback) callback(); };
   chrome.runtime.sendMessage({ action:'getTeamStats' }, r => {
     const err = chrome.runtime.lastError;
     if (err) {
-      if (attemptsLeft > 1) {
-        setTimeout(() => _pollTeamStatsWithRetry(attemptsLeft - 1, callback), 2000);
-      } else {
-        _renderTeamError('Extension messaging error — reload the panel');
-      }
-      if (callback) callback();
+      if (attemptsLeft > 1) { retry(); return; }
+      _renderTeamError('Extension messaging error — reload the panel');
+      done();
       return;
     }
     if (!r) {
       // No response — SW suspended mid-call; retry
-      if (attemptsLeft > 1) setTimeout(() => _pollTeamStatsWithRetry(attemptsLeft - 1, callback), 2000);
-      else _renderTeamError('No response from background — try reloading');
+      if (attemptsLeft > 1) { retry(); return; }
+      _renderTeamError('No response from background — try reloading');
     } else if (r.error) {
-      if (attemptsLeft > 1) {
-        setTimeout(() => _pollTeamStatsWithRetry(attemptsLeft - 1, callback), 2000);
-      } else {
-        _renderTeamError('DB error: ' + r.error);
-      }
+      if (attemptsLeft > 1) { retry(); return; }
+      _renderTeamError('DB error: ' + r.error);
     } else {
       renderTeamStats(r);
     }
-    if (callback) callback();
+    done();
   });
 }
 

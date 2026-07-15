@@ -31,7 +31,11 @@ function extractDeclaration(src, name, endLineRe) {
   if (!m) throw new Error(`extractDeclaration: "${name}" not found`);
   const lineStart = src.lastIndexOf('\n', m.index) + 1;
   const rest = src.slice(lineStart);
-  const lines = rest.split('\n');
+  // AUDIT-FIX: split on \r?\n and strip trailing \r — a git checkout with CRLF
+  // line endings (Windows autocrlf) left every line ending in \r, so the
+  // anchored endLineRe (e.g. /^\]\);$/) never matched and every extraction
+  // "failed" even though the source was fine.
+  const lines = rest.split(/\r?\n/);
   const out = [];
   for (const line of lines) {
     out.push(line);

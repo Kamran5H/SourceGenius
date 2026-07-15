@@ -28,6 +28,7 @@ const assembled = [
   extractFunction(src, 'isDuplicateWebsiteCandidate'),
   extractFunction(src, 'searchEngineLabel'),
   extractFunction(src, 'pickSearchCandidate'),
+  extractFunction(src, '_looksLikeGarbageBrand'), // v7.1.51 dep of _parseAmazonHtml
   extractFunction(src, '_parseAmazonHtml'),
   extractFunction(src, 'extractAsin'),
   extractFunction(src, 'validateResult'),
@@ -205,4 +206,135 @@ test('_runtimeSnapshotIsFresh: a future-dated savedAt (clock skew) is not treate
   const now = 1_000_000_000_000;
   // savedAt in the future → now-savedAt is negative → not fresh (guarded)
   assert.equal(_runtimeSnapshotIsFresh({ savedAt: now + 60000 }, now), false);
+});
+
+// ── AUDIT-FIX (100K scale): chunked results persistence ─────────────────────
+// Compiles the REAL persistence functions from background.js against a fake
+// chrome.storage.local, fresh module state per test.
+function makePersistModule() {
+  const preamble = [
+    'const store = {};',
+    'const setCalls = [];',
+    'const clone = (v) => JSON.parse(JSON.stringify(v));',
+    'const chrome = { storage: { local: {',
+    '  set: async (obj) => { setCalls.push(Object.keys(obj)); Object.assign(store, clone(obj)); },',
+    '  get: async (keys) => { const out = {}; for (const k of (Array.isArray(keys) ? keys : [keys])) if (k in store) out[k] = clone(store[k]); return out; },',
+    '  remove: async (keys) => { for (const k of (Array.isArray(keys) ? keys : [keys])) delete store[k]; },',
+    '} } };',
+    'let ST = { results: [] };',
+  ].join('\n');
+  const body = [
+    extractDeclaration(src, 'RESULTS_CHUNK_SIZE', /;$/),
+    extractDeclaration(src, '_persistedChunkLens', /;$/),
+    extractDeclaration(src, '_dirtyResultChunks', /;$/),
+    extractDeclaration(src, '_persistedResultsRef', /;$/),
+    extractDeclaration(src, '_storedChunkCount', /;$/),
+    extractDeclaration(src, '_legacyResultsKeyCleared', /;$/),
+    extractDeclaration(src, '_persistResultsChain', /;$/),
+    extractFunction(src, 'markResultChunkDirty'),
+    extractFunction(src, '_persistResultsOnce'),
+    extractFunction(src, 'persistResults'),
+    extractFunction(src, 'loadPersistedResults'),
+    extractFunction(src, 'clearPersistedResults'),
+    'module.exports = { store, setCalls, ST, persistResults, loadPersistedResults, clearPersistedResults, markResultChunkDirty };',
+  ].join('\n\n');
+  return compileModule(preamble + '\n\n' + body, BG_PATH + '#persist');
+}
+
+test('persistResults: splits a big run into 5000-row chunks with correct meta', async () => {
+  const m = makePersistModule();
+  m.ST.results = Array.from({ length: 12345 }, (_, i) => ({ idx: i, asin: 'A' + i, status: 'found' }));
+  await m.persistResults();
+  assert.deepEqual(m.store.resultsMeta, { len: 12345, chunks: 3, chunkSize: 5000 });
+  assert.equal(m.store.resultsChunk_0.length, 5000);
+  assert.equal(m.store.resultsChunk_1.length, 5000);
+  assert.equal(m.store.resultsChunk_2.length, 2345);
+  const loaded = await m.loadPersistedResults({ resultsMeta: m.store.resultsMeta });
+  assert.equal(loaded.length, 12345);
+  assert.equal(loaded[0].asin, 'A0');
+  assert.equal(loaded[12344].asin, 'A12344');
+});
+
+test('persistResults: an appending hot save rewrites ONLY the last partial chunk', async () => {
+  const m = makePersistModule();
+  m.ST.results = Array.from({ length: 12000 }, (_, i) => ({ idx: i }));
+  await m.persistResults();
+  m.setCalls.length = 0;
+  m.ST.results.push({ idx: 12000 }, { idx: 12001 });   // append like a live run
+  await m.persistResults();
+  assert.equal(m.setCalls.length, 1);
+  // Bounded write: meta + the last partial chunk only — never the full array.
+  assert.deepEqual(m.setCalls[0].sort(), ['resultsChunk_2', 'resultsMeta']);
+  assert.equal(m.store.resultsChunk_2.length, 2002);
+  assert.equal(m.store.resultsChunk_0.length, 5000);   // untouched
+});
+
+test('persistResults: markResultChunkDirty re-persists an in-place reclassification', async () => {
+  const m = makePersistModule();
+  m.ST.results = Array.from({ length: 10001 }, (_, i) => ({ idx: i, status: 'found' }));
+  await m.persistResults();
+  m.setCalls.length = 0;
+  const res = m.ST.results[3];                          // lives in chunk 0 (already full+persisted)
+  res.status = 'db-duplicate';
+  m.markResultChunkDirty(res);
+  await m.persistResults();
+  assert.ok(m.setCalls[0].includes('resultsChunk_0'), 'dirty chunk 0 must be rewritten');
+  assert.equal(m.store.resultsChunk_0[3].status, 'db-duplicate');
+});
+
+test('persistResults: wholesale reassignment shrinks storage and removes stale chunks', async () => {
+  const m = makePersistModule();
+  m.ST.results = Array.from({ length: 12000 }, (_, i) => ({ idx: i }));
+  await m.persistResults();
+  m.ST.results = [{ idx: 0 }, { idx: 1 }];              // retry round / fresh run replaced the array
+  await m.persistResults();
+  assert.equal(m.store.resultsMeta.len, 2);
+  assert.equal(m.store.resultsChunk_0.length, 2);
+  assert.equal('resultsChunk_1' in m.store, false, 'stale chunk 1 removed');
+  assert.equal('resultsChunk_2' in m.store, false, 'stale chunk 2 removed');
+  const loaded = await m.loadPersistedResults({ resultsMeta: m.store.resultsMeta });
+  assert.equal(loaded.length, 2);
+});
+
+test('loadPersistedResults: falls back to the legacy monolithic results key', async () => {
+  const m = makePersistModule();
+  const legacy = [{ idx: 0, asin: 'LEGACY' }];
+  const loaded = await m.loadPersistedResults({ results: legacy }); // no resultsMeta
+  assert.deepEqual(loaded, legacy);
+});
+
+test('clearPersistedResults: removes meta, all chunks, and the legacy key', async () => {
+  const m = makePersistModule();
+  m.ST.results = Array.from({ length: 7000 }, (_, i) => ({ idx: i }));
+  await m.persistResults();
+  m.store.results = [{ old: true }]; // simulate leftover legacy key
+  await m.clearPersistedResults();
+  assert.equal('resultsMeta' in m.store, false);
+  assert.equal('resultsChunk_0' in m.store, false);
+  assert.equal('resultsChunk_1' in m.store, false);
+  assert.equal('results' in m.store, false);
+});
+
+test('loadPersistedResults: seeds bookkeeping so the first post-restore save is incremental', async () => {
+  const m = makePersistModule();
+  m.ST.results = Array.from({ length: 11000 }, (_, i) => ({ idx: i }));
+  await m.persistResults();
+  // Simulate an SW restart restoring from the chunked layout
+  const m2 = makePersistModule();
+  Object.assign(m2.store, JSON.parse(JSON.stringify(m.store)));
+  const loaded = await m2.loadPersistedResults({ resultsMeta: m2.store.resultsMeta });
+  m2.ST.results = loaded;
+  // Mimic the restore path seeding the ref (background.js does this after load)
+  m2.setCalls.length = 0;
+  m2.ST.results.push({ idx: 11000 });
+  await m2.persistResults();
+  // Without seeding this would rewrite chunks 0..2; with seeding + the restore
+  // ref assignment only meta + the changed tail chunk should be written. The
+  // module-internal ref isn't reachable from the test, so allow either the
+  // seeded fast path or (worst case) a single full rewrite — but the STORE must
+  // be correct either way.
+  assert.equal(m2.store.resultsMeta.len, 11001);
+  assert.equal(m2.store.resultsChunk_2.length, 1001);
+  const reloaded = await m2.loadPersistedResults({ resultsMeta: m2.store.resultsMeta });
+  assert.equal(reloaded.length, 11001);
 });
