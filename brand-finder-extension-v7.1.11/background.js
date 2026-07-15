@@ -1160,6 +1160,14 @@ async function enableAmazonScrapeMode() {
           { header: 'Sec-Fetch-Mode', operation: 'set', value: 'navigate' },
           { header: 'Sec-Fetch-Dest', operation: 'set', value: 'document' },
           { header: 'Sec-Fetch-User', operation: 'set', value: '?1' },
+          // AUDIT-FIX (stealth): an extension-origin fetch() attaches
+          // `Origin: chrome-extension://<id>`, which flatly contradicts the
+          // `Sec-Fetch-Site: same-origin` we set right above — a textbook
+          // automation tell that made Amazon soft-wall the tabless read even
+          // when every other header was normalized. DNR is the only layer that
+          // can touch Origin from a service-worker fetch(); strip it so the
+          // request actually reads as a same-origin navigation.
+          { header: 'Origin', operation: 'remove' },
         ],
       },
       condition: {
@@ -1877,6 +1885,37 @@ async function seedAmazonSession(domain) {
   } finally {
     if (tid) tidClose(tid);
   }
+}
+
+// ── Tabless-read health tracker (the "background always blocked" fix) ────────
+// An extension-origin fetch() to Amazon is inherently more detectable than a
+// real tab navigation, so on some IP/session states Amazon soft-walls EVERY
+// tabless product read while still serving real tabs. The old flow paid that
+// tax on every single item: a blocked fetch (which BURNS a per-IP rate token)
+// followed by the tab read that actually works. This tracks the recent tabless
+// block rate; when tabless is reliably walling, processItem skips it and goes
+// straight to the real-tab read — halving Amazon request volume (less wall
+// pressure) and removing the wasted 4–8s per item. It periodically re-probes so
+// the fast tabless path is restored the moment Amazon calms down.
+// recent outcomes, true = blocked (comments above each — test/_extract.js needs the line to end in ";")
+let _tablessWindow = [];
+const _TABLESS_WIN = 20;
+let _tablessProbeCounter = 0;
+function _recordTablessOutcome(blocked) {
+  _tablessWindow.push(!!blocked);
+  if (_tablessWindow.length > _TABLESS_WIN) _tablessWindow.shift();
+}
+function _tablessBlockRate() {
+  if (!_tablessWindow.length) return 0;
+  return _tablessWindow.filter(Boolean).length / _tablessWindow.length;
+}
+function _shouldTryTabless() {
+  // Need a few samples before trusting the rate — always probe early in a run.
+  if (_tablessWindow.length < 6) return true;
+  // Healthy (<60% blocked) → keep using the fast tabless path.
+  if (_tablessBlockRate() < 0.6) return true;
+  // Reliably walled → skip tabless, but re-probe 1 in 8 to detect recovery.
+  return (++_tablessProbeCounter % 8) === 0;
 }
 
 async function fetchAmazonProduct(url, tabTimeout) {
@@ -2979,12 +3018,27 @@ async function processItem(item, mcfg) {
     // ── 1a: Direct tabless fetch() of the product HTML (primary path) ──────
     // Parsed by regex (service worker has no DOM). CAPTCHAs/bot-walls return
     // blocked:true; the tab-recovery step (1b) handles those.
-    try {
-      fetchResult = await fetchAmazonProduct(item.url, mcfg.tabTimeout);
-    } catch(fe) {
-      addLog(`  ↩ Amazon fetch error (${fe.message}) — retrying once`);
-      await sleep(1000);
-      try { fetchResult = await fetchAmazonProduct(item.url, mcfg.tabTimeout); } catch(_) {}
+    if (_shouldTryTabless()) {
+      try {
+        fetchResult = await fetchAmazonProduct(item.url, mcfg.tabTimeout);
+      } catch(fe) {
+        addLog(`  ↩ Amazon fetch error (${fe.message}) — retrying once`);
+        await sleep(1000);
+        try { fetchResult = await fetchAmazonProduct(item.url, mcfg.tabTimeout); } catch(_) {}
+      }
+      // A blocked/markerless tabless read is the exact condition step 1b recovers
+      // via a real tab — feed it to the health tracker so a reliably-walled IP
+      // flips to tab-first instead of paying the blocked-fetch tax every item.
+      const _tablessBlocked = !fetchResult || !!fetchResult.blocked ||
+        (!fetchResult.brand && !fetchResult.hasProductMarkers);
+      _recordTablessOutcome(_tablessBlocked);
+    } else {
+      // Tabless read has been reliably walled on this IP/session — skip it and
+      // go straight to the real-tab read (step 1b). Saves a blocked request + a
+      // rate token per item and stops feeding the per-IP wall. fetchResult stays
+      // null so the _fetchBlocked branch below fires the tab recovery.
+      fetchResult = null;
+      addLog('  ⏭ Tabless read walling — going straight to real-tab read');
     }
 
     if (fetchResult?.hasCaptcha) {

@@ -372,3 +372,45 @@ test('_rateMin/_rateMax: 6 copies each get 1/6 of the per-IP budget (floor inclu
   // the old fixed floor: 6 copies × 21/min = 126/min aggregate — never clears
   assert.ok(m._rateMin() * 6 * 60 < 22, 'shared floor aggregate must be far below the old 126/min');
 });
+
+// ── Tabless-read health gate (the "background always blocked" fix) ──────────
+function makeTablessModule() {
+  const asm = [
+    extractDeclaration(src, '_tablessWindow', /;$/),
+    extractDeclaration(src, '_TABLESS_WIN', /;$/),
+    extractDeclaration(src, '_tablessProbeCounter', /;$/),
+    extractFunction(src, '_recordTablessOutcome'),
+    extractFunction(src, '_tablessBlockRate'),
+    extractFunction(src, '_shouldTryTabless'),
+    'module.exports = { _recordTablessOutcome, _tablessBlockRate, _shouldTryTabless };',
+  ].join('\n\n');
+  return compileModule(asm, BG_PATH + '#tabless');
+}
+
+test('_shouldTryTabless: always probes early (fewer than 6 samples)', () => {
+  const m = makeTablessModule();
+  for (let i = 0; i < 5; i++) { assert.equal(m._shouldTryTabless(), true); m._recordTablessOutcome(true); }
+});
+
+test('_shouldTryTabless: keeps the fast path while tabless is healthy', () => {
+  const m = makeTablessModule();
+  for (let i = 0; i < 20; i++) m._recordTablessOutcome(false); // all clean
+  assert.equal(m._tablessBlockRate(), 0);
+  assert.equal(m._shouldTryTabless(), true);
+});
+
+test('_shouldTryTabless: skips tabless when reliably walled, but re-probes ~1 in 8', () => {
+  const m = makeTablessModule();
+  for (let i = 0; i < 20; i++) m._recordTablessOutcome(true); // all blocked
+  assert.equal(m._tablessBlockRate(), 1);
+  let tries = 0;
+  for (let i = 0; i < 40; i++) if (m._shouldTryTabless()) tries++;
+  assert.ok(tries >= 3 && tries <= 7, `expected ~5 re-probes in 40, got ${tries}`);
+});
+
+test('_tablessBlockRate: rolls over a bounded 20-sample window', () => {
+  const m = makeTablessModule();
+  for (let i = 0; i < 20; i++) m._recordTablessOutcome(true);  // window full of blocks
+  for (let i = 0; i < 20; i++) m._recordTablessOutcome(false); // push them all out
+  assert.equal(m._tablessBlockRate(), 0);
+});
