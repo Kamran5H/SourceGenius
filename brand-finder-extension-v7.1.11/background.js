@@ -1406,7 +1406,8 @@ async function _tabWatchdogCheckOne(tabId) {
     return;
   }
 
-  if (!(await _isTabAlive(tabId))) { _untrackTab(tabId); return; }
+  const tabObj = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tabObj) { _untrackTab(tabId); return; }
 
   // v7.1.46: RESTORED responsiveness watchdog. A tab can be "alive" (chrome.tabs
   // .get resolves) while its renderer is wedged — executeScript never runs, so
@@ -1436,8 +1437,23 @@ async function _tabWatchdogCheckOne(tabId) {
   // hard-refresh stuck tabs — a reload of a walled Amazon tab is exactly the
   // pressure the rest is trying to drain. The KILL_MS close path still runs, so
   // a genuinely dead tab is still reaped; we just stop re-fetching during the rest.
-  if (now - lastReload >= TAB_WD_REFRESH_EVERY_MS && Date.now() >= _wallBreakerUntil) {
+  // AUDIT-FIX (live-run log): the watchdog hard-refreshed on the FIRST failed
+  // ping — "Tab N unresponsive 0s — hard refresh". A tab that's merely busy
+  // loading a heavy page fails the 3s ping probe, got instantly reloaded,
+  // restarted its load, failed the next ping… a refresh loop that churned tabs
+  // until the 60s hard cap closed them. Require a tab to stay unresponsive
+  // across at least one more tick (10s) before the first refresh.
+  // AUDIT-FIX (rate): the reload is a full Amazon page fetch but was UNMETERED —
+  // free extra pressure on an already-walled IP, sustaining the wall the rate
+  // bucket was trying to drain. Amazon-tab reloads now consume a rate token
+  // like every other Amazon request.
+  if (stuckMs >= 10000 && now - lastReload >= TAB_WD_REFRESH_EVERY_MS && Date.now() >= _wallBreakerUntil) {
     _tabReloadedAt.set(tabId, now);
+    const isAmazonTab = /(^|\.)amazon\./.test(String(tabObj.url || tabObj.pendingUrl || ''));
+    if (isAmazonTab) {
+      await _awaitAmazonRateToken();
+      if (Date.now() < _wallBreakerUntil) return; // breaker opened while waiting — skip the reload
+    }
     addLog(`  🔄 Tab ${tabId} unresponsive ${Math.round(stuckMs / 1000)}s — hard refresh`);
     chrome.tabs.reload(tabId, { bypassCache: true }).catch(() => {});
   }
