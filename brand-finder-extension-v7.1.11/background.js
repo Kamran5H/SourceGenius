@@ -2712,6 +2712,19 @@ async function processLoop() {
   // Helper tabs are created on first use inside fetchAmazonProduct — no pre-warm needed.
   // This lets the job start immediately instead of waiting for tabs to open and load.
 
+  // v7.1.53: say ONCE, up front, which brand-read path this run will use. The
+  // local browser is the only path that survives a walled IP, but its absence is
+  // a silent fallback — a run without it looks identical in the log except that
+  // every read is blocked, which is impossible to diagnose from the panel. State
+  // it plainly instead: pasted ASINs carry no brandHint, so with the server down
+  // a walled IP has nothing to fall back on and each item can only end 'error'.
+  if (await _brandServerAvailable()) {
+    addLog('🎭 Local brand browser is UP — Amazon reads go through real Chrome (no helper tabs, no images)');
+  } else {
+    addLog('⚠️ Local brand browser is DOWN — falling back to in-extension reads (helper tabs, images load, blocks likely).');
+    addLog('   ▶ Start it: double-click amazon-playwright-scraper\\start.bat, then press Start again.');
+  }
+
   async function worker() {
     while (ST.running) {
         let myIdx = null;
@@ -2830,13 +2843,24 @@ async function processLoop() {
     while (waited < cool && ST.running) { setSgGuardCookie(true); await sleep(1000); waited += 1000; } // interruptible by Stop
     if (!ST.running) break;
 
+    // v7.1.53: REPLACE the queue, never append to it. This loop only runs when
+    // ST.idx >= ST.queue.length (the queue is fully drained), so the consumed
+    // entries are dead weight and rebuilding from retryItems is safe.
+    //
+    // Appending was unbounded: every retry round AND every service-worker restart
+    // pushed the same failed ASINs back on and nothing ever removed them. A live
+    // 2,641-ASIN run was observed at "[2420/193393]" — ~73 rounds of accumulation.
+    // The whole array is persisted on each save, so it bloated storage, and the
+    // progress display became meaningless.
     for (const item of retryItems) {
-      // AUDIT-FIX: idx was missing here — retried rows rendered as "NaN" in the
-      // sidepanel's # column (every other queue-builder sets idx).
-      ST.queue.push({ idx: ST.queue.length, asin: item.asin, url: item.url, raw: item.raw, brandHint: item.brandHint });
       if (item.status === 'error')   ST.stats.errors   = Math.max(0, ST.stats.errors   - 1);
       if (item.status === 'skipped') ST.stats.notFound  = Math.max(0, ST.stats.notFound  - 1);
     }
+    ST.queue = retryItems.map((item, i) => ({
+      idx: i, asin: item.asin, url: item.url, raw: item.raw, brandHint: item.brandHint,
+    }));
+    ST.idx = 0;
+    _inFlightIndices.clear(); // idx just rebased — stale indices would roll idx back onto the wrong items
     // Drop the old failed results + roll back the done counter for the re-queued items
     ST.results = ST.results.filter(r => !isRetryable(r));
     // AUDIT-FIX: results just SHRANK in place while the run is live. The broadcast

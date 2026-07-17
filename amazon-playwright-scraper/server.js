@@ -9,7 +9,7 @@ chromium.use(stealth);
 // Raw (un-stealthed) Playwright for the brand reader — it drives the REAL
 // installed Chrome via channel:'chrome' with a persistent profile, where the
 // stealth plugin's patches are unnecessary and only add fingerprint surface.
-// See _getBrandContext for why that combination is what beats the 202 block.
+// See _getWorkerContext for why that combination is what beats the 202 block.
 const { chromium: rawChromium } = require('playwright');
 
 // ── Minimal .env loader (no new dependency) ─────────────────────────────────
@@ -552,37 +552,80 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
 // (background.js `fetchAmazonProductViaTab`) so brands come out byte-identical
 // — the search/match logic downstream sees no change in its input.
 
-const BRAND_CONCURRENCY  = Number(process.env.SG_BRAND_CONCURRENCY) || 3;
+// ── Pool sizing ─────────────────────────────────────────────────────────────
+// Throughput is bound by PAGES, not page weight, and one browser saturates at
+// ~3 concurrent pages: measured, 3 pages ran clean while 6 timed out on ~2/3 of
+// reads (page.goto timeout — capacity, not an Amazon block). Blocking CSS/fonts
+// cut per-page load 43% and moved end-to-end throughput barely at all, which is
+// what proves the bottleneck is here and not in bytes.
+//
+// So scale with browser INSTANCES: each is its own real-Chrome persistent
+// profile with its own cookie jar, and each sustains ~400 brands/hr. Two extra
+// wins beyond speed: a block is per-profile, so one hot jar no longer stalls
+// everything, and a failed read can be retried on a DIFFERENT profile instead of
+// falling back to the extension's walled path (which is where errors come from).
+//
+// They all still share ONE IP. Profiles do not buy per-IP rate budget, so this
+// scales until Amazon's per-IP ceiling bites, not indefinitely.
+const BRAND_BROWSERS     = Number(process.env.SG_BRAND_BROWSERS) || 3;
+const BRAND_CONCURRENCY  = Number(process.env.SG_BRAND_CONCURRENCY) || 3; // pages PER browser
 const BRAND_REST_MS      = Number(process.env.SG_BRAND_REST_MS) || 45000;
 const BRAND_BLOCK_STRIKES = 5;
+const BRAND_TRIES        = 2; // attempts per ASIN, each on a different browser
 
-let _brandBrowser   = null;
-let _brandContext   = null;
-let _brandLaunching = null;
-let _brandStrikes   = 0;
-let _brandRestUntil = 0;
-let _brandActive    = 0;
-const _brandQueue   = [];
+// One entry per browser instance.
+const _pool = Array.from({ length: BRAND_BROWSERS }, (_, i) => ({
+  id: i,
+  ctx: null,
+  launching: null,
+  active: 0,
+  strikes: 0,
+  restUntil: 0,
+}));
 // cssRescued counts pages where blocking stylesheets hid the byline and the
 // guard re-read recovered it. If this climbs, Amazon has started serving the
 // degraded no-CSS skeleton again and BRAND_BLOCK_FAST should drop 'stylesheet'.
-let _brandStats     = { ok: 0, blocked: 0, empty: 0, cssRescued: 0, errors: 0 };
+let _brandStats     = { ok: 0, blocked: 0, empty: 0, cssRescued: 0, errors: 0, retried: 0 };
 
-function _acquireBrandSlot() {
+// Wait for a free page slot on ANY non-resting browser, then reserve it.
+// Least-loaded rather than round-robin: reads finish at wildly different speeds,
+// so round-robin parks work behind a slow browser while another sits idle.
+const _waiters = [];
+function _freeWorker() {
+  const now = Date.now();
+  const ready = _pool
+    .filter(w => w.active < BRAND_CONCURRENCY && now >= w.restUntil)
+    .sort((a, b) => a.active - b.active);
+  return ready[0] || null;
+}
+function _acquireWorker(exclude = -1) {
   return new Promise(resolve => {
-    if (_brandActive < BRAND_CONCURRENCY) { _brandActive++; return resolve(); }
-    _brandQueue.push(resolve);
+    const now = Date.now();
+    const ready = _pool
+      .filter(w => w.active < BRAND_CONCURRENCY && now >= w.restUntil && w.id !== exclude)
+      .sort((a, b) => a.active - b.active);
+    const w = ready[0];
+    if (w) { w.active++; return resolve(w); }
+    _waiters.push({ resolve, exclude });
   });
 }
-function _releaseBrandSlot() {
-  _brandActive = Math.max(0, _brandActive - 1);
-  const next = _brandQueue.shift();
-  if (next) { _brandActive++; next(); }
+function _releaseWorker(w) {
+  w.active = Math.max(0, w.active - 1);
+  // Hand the freed slot to the first waiter that can use it. A waiter excluding
+  // this browser (a retry) must not be woken by it, or the retry lands on the
+  // same profile that just failed and the second attempt is worthless.
+  for (let i = 0; i < _waiters.length; i++) {
+    if (_waiters[i].exclude === w.id) continue;
+    if (Date.now() < w.restUntil) break;
+    const { resolve } = _waiters.splice(i, 1)[0];
+    w.active++;
+    return resolve(w);
+  }
 }
 
-async function _closeBrandBrowser() {
-  const c = _brandContext;
-  _brandBrowser = null; _brandContext = null;
+async function _closeWorker(w) {
+  const c = w.ctx;
+  w.ctx = null; w.launching = null;
   if (c) await c.close().catch(() => {});
 }
 
@@ -604,12 +647,16 @@ async function _closeBrandBrowser() {
 // a genuine Chrome profile with its own real UA is the least detectable thing
 // available, and overriding the UA only desynchronises it from the real client
 // hints Chrome sends.
-const BRAND_PROFILE_DIR = process.env.SG_BRAND_PROFILE || path.join(os.homedir(), '.sg-brand-profile');
+// Each browser gets its OWN profile dir — launchPersistentContext takes an
+// exclusive lock on it, so a shared dir would make every instance past the first
+// fail to launch. Separate jars are also the point: a block is then per-profile.
+const BRAND_PROFILE_BASE = process.env.SG_BRAND_PROFILE || path.join(os.homedir(), '.sg-brand-profile');
+const _profileDir = (id) => `${BRAND_PROFILE_BASE}-${id}`;
 
-async function _getBrandContext(domain) {
-  if (_brandContext) return _brandContext;
-  if (_brandLaunching) return _brandLaunching;
-  _brandLaunching = (async () => {
+async function _getWorkerContext(w, domain) {
+  if (w.ctx) return w.ctx;
+  if (w.launching) return w.launching;
+  w.launching = (async () => {
     try {
       const proxy = nextProxy();
       const opts = {
@@ -624,25 +671,24 @@ async function _getBrandContext(domain) {
         args: ['--disable-blink-features=AutomationControlled'],
       };
       if (proxy) opts.proxy = proxy;
-      _brandContext = await rawChromium.launchPersistentContext(BRAND_PROFILE_DIR, opts);
-      _brandBrowser = _brandContext.browser();
-      await _brandContext.addCookies([{
+      w.ctx = await rawChromium.launchPersistentContext(_profileDir(w.id), opts);
+      await w.ctx.addCookies([{
         name: 'x-amz-postal-code', value: SCRAPE_ZIP, domain: '.' + domain, path: '/',
       }]).catch(() => {});
       // Resource blocking is applied per-PAGE (see _readPage) rather than here,
       // so the CSS-degrade guard can re-read a page with a different block list.
       // Warm the jar on the homepage before any /dp/ hit — see the 202 note above.
-      const warm = await _brandContext.newPage();
+      const warm = await w.ctx.newPage();
       await warm.goto(`https://www.${domain}/`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
       await warm.waitForTimeout(2000);
       await warm.close().catch(() => {});
-      console.log(`🏷️  Brand browser ready — real Chrome, profile ${BRAND_PROFILE_DIR} (concurrency ${BRAND_CONCURRENCY}, headless=${HEADLESS})`);
-      return _brandContext;
+      console.log(`🏷️  Brand browser #${w.id} ready — real Chrome, profile ${_profileDir(w.id)}`);
+      return w.ctx;
     } finally {
-      _brandLaunching = null;
+      w.launching = null;
     }
   })();
-  return _brandLaunching;
+  return w.launching;
 }
 
 // VERBATIM port of the extension's in-tab extractor. Keep the two in sync.
@@ -731,13 +777,11 @@ async function _readPage(ctx, url, blockList) {
   }
 }
 
-async function readBrand(url, domain) {
-  if (Date.now() < _brandRestUntil) {
-    return { blocked: true, resting: true, restMs: _brandRestUntil - Date.now() };
-  }
-  await _acquireBrandSlot();
+// One attempt on one browser. Returns null when the attempt should be retried
+// elsewhere (blocked or errored); throws nothing.
+async function _attemptRead(w, url, domain) {
   try {
-    const ctx = await _getBrandContext(domain);
+    const ctx = await _getWorkerContext(w, domain);
     let { status, blocked, out } = await _readPage(ctx, url, BRAND_BLOCK_FAST);
 
     // Amazon's silent bot block is an HTTP 202 with an EMPTY body — no CAPTCHA,
@@ -747,47 +791,72 @@ async function readBrand(url, domain) {
     // never gets retried. 429/503 are the ordinary throttle responses.
     if (blocked) {
       if (status === 202 || status === 429 || status === 503) {
-        console.log(`  🚫 Brand read blocked — HTTP ${status} (silent bot block)`);
+        console.log(`  🚫 #${w.id} blocked — HTTP ${status} (silent bot block)`);
       }
       _brandStats.blocked++;
-      if (++_brandStrikes >= BRAND_BLOCK_STRIKES) {
-        // A real browser being walled means the IP itself is hot — resting and
-        // relaunching with a fresh profile session is the only thing that helps.
-        _brandRestUntil = Date.now() + BRAND_REST_MS;
-        _brandStrikes = 0;
-        console.log(`🧊 Brand browser walled ${BRAND_BLOCK_STRIKES}x — resting ${Math.round(BRAND_REST_MS / 1000)}s and relaunching`);
-        await _closeBrandBrowser();
+      if (++w.strikes >= BRAND_BLOCK_STRIKES) {
+        // This PROFILE is hot. Rest and relaunch just this one — the other
+        // browsers keep serving, which is the main reason the pool exists.
+        w.restUntil = Date.now() + BRAND_REST_MS;
+        w.strikes = 0;
+        console.log(`🧊 Brand browser #${w.id} walled ${BRAND_BLOCK_STRIKES}x — resting ${Math.round(BRAND_REST_MS / 1000)}s and relaunching`);
+        await _closeWorker(w);
       }
-      return { blocked: true };
+      return null;
     }
 
     // CSS-degrade guard: a product page that rendered but carries no brand is the
     // one outcome blocking CSS could plausibly have caused. Pay one re-read with
     // stylesheets on rather than emit a false "no brand" (→ 'skipped', no retry).
     if (out && out.hasProductMarkers && !out.brand) {
-      const retry = await _readPage(ctx, url, BRAND_BLOCK_LIGHT);
-      if (retry.out && retry.out.brand) {
+      const rescue = await _readPage(ctx, url, BRAND_BLOCK_LIGHT);
+      if (rescue.out && rescue.out.brand) {
         _brandStats.cssRescued++;
-        console.log(`  🎨 Brand only visible with CSS on — "${retry.out.brand}" (${url.slice(-10)})`);
-        out = retry.out;
+        console.log(`  🎨 Brand only visible with CSS on — "${rescue.out.brand}" (${url.slice(-10)})`);
+        out = rescue.out;
       }
     }
 
-    _brandStrikes = 0; // a page that rendered is proof the session still works
-    if (out && out.brand) _brandStats.ok++; else _brandStats.empty++;
-    return { blocked: false, ...out };
+    w.strikes = 0; // a page that rendered is proof this session still works
+    return out;
   } catch (e) {
     // Almost always `page.goto: Timeout` from too many parallel pages in one
     // browser — a capacity problem, NOT an Amazon block, so it must not feed the
-    // wall/strike accounting. Measured: 3 parallel pages are clean, 6 times out
-    // on ~2/3 of reads (and the failures LOOK fast, so raw throughput numbers
-    // flatter a broken setting). If `errors` is climbing, lower concurrency.
+    // strike/rest accounting. Measured: 3 pages per browser are clean, 6 time out
+    // on ~2/3 of reads (and failures LOOK fast, so raw throughput flatters a
+    // broken setting). If `errors` climbs, lower SG_BRAND_CONCURRENCY.
     _brandStats.errors++;
-    console.log(`  ⚠️ Brand read failed (${String(e.message).split('\n')[0].slice(0, 60)})`);
-    return { blocked: false, error: e.message, brand: '', title: '', hasProductMarkers: false };
-  } finally {
-    _releaseBrandSlot();
+    console.log(`  ⚠️ #${w.id} read failed (${String(e.message).split('\n')[0].slice(0, 60)})`);
+    return null;
   }
+}
+
+async function readBrand(url, domain) {
+  let out = null;
+  let lastId = -1;
+  // Retry on a DIFFERENT browser. A block is per-profile, so the second profile
+  // usually reads the same page fine — that retry is what keeps a blocked read
+  // from becoming an extension 'error', which is the whole error story for raw
+  // ASINs (they have no brandHint to fall back on).
+  for (let attempt = 1; attempt <= BRAND_TRIES && !out; attempt++) {
+    const w = await _acquireWorker(attempt > 1 ? lastId : -1);
+    lastId = w.id;
+    try {
+      out = await _attemptRead(w, url, domain);
+    } finally {
+      _releaseWorker(w);
+    }
+    if (!out && attempt < BRAND_TRIES) _brandStats.retried++;
+  }
+
+  if (!out) {
+    // Every browser failed this URL. Report blocked so the extension runs its own
+    // wall accounting and queues the item for its retry rounds.
+    return { blocked: true };
+  }
+
+  if (out.brand) _brandStats.ok++; else _brandStats.empty++;
+  return { blocked: false, ...out };
 }
 
 // POST /brand { url } | { asin, domain } → { brand, title, asin, hasProductMarkers, blocked }
@@ -817,12 +886,20 @@ app.post('/brand', async (req, res) => {
 });
 
 app.get('/brand/stats', (req, res) => {
+  const now = Date.now();
   res.json({
     ..._brandStats,
-    concurrency: BRAND_CONCURRENCY,
-    resting: Date.now() < _brandRestUntil,
-    restMsLeft: Math.max(0, _brandRestUntil - Date.now()),
-    up: !!_brandContext,
+    browsers: BRAND_BROWSERS,
+    pagesPerBrowser: BRAND_CONCURRENCY,
+    capacity: BRAND_BROWSERS * BRAND_CONCURRENCY,
+    // up as soon as ANY browser can serve — the pool degrades, it does not stop.
+    up: _pool.some(w => !!w.ctx),
+    resting: _pool.every(w => now < w.restUntil),
+    waiting: _waiters.length,
+    pool: _pool.map(w => ({
+      id: w.id, up: !!w.ctx, active: w.active, strikes: w.strikes,
+      restMsLeft: Math.max(0, w.restUntil - now),
+    })),
   });
 });
 
