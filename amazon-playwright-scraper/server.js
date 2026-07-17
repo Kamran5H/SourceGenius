@@ -6,6 +6,11 @@ const path    = require('path');
 const { chromium } = require('playwright-extra');
 const stealth = require('puppeteer-extra-plugin-stealth')();
 chromium.use(stealth);
+// Raw (un-stealthed) Playwright for the brand reader — it drives the REAL
+// installed Chrome via channel:'chrome' with a persistent profile, where the
+// stealth plugin's patches are unnecessary and only add fingerprint surface.
+// See _getBrandContext for why that combination is what beats the 202 block.
+const { chromium: rawChromium } = require('playwright');
 
 // ── Minimal .env loader (no new dependency) ─────────────────────────────────
 // Reads a .env file next to this script, if present, and merges KEY=VALUE
@@ -527,6 +532,299 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
 
   return final;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BRAND READER — the raw-ASIN path
+// ═══════════════════════════════════════════════════════════════════════════
+// The extension reads a product-page brand with a service-worker fetch() and,
+// on failure, a helper tab. Both are walled hard on a rate-limited IP: the SW
+// fetch can't set Sec-Fetch/UA/Referer (forbidden headers) and leaks an
+// extension Origin, and the tabs share the same throttled profile. When the
+// wall is up, EVERY raw ASIN ends as "Amazon page blocked — brand unread",
+// because a pasted ASIN has no brandHint to fall back on.
+//
+// A real headed Chromium with the stealth plugin, a genuine TLS/JA3
+// fingerprint and a warm cookie jar reads those same pages while the extension
+// is walled. This endpoint exposes exactly that, one ASIN at a time, so the
+// extension can hand off the brand read and keep its own pipeline for search.
+//
+// The extractor below is a VERBATIM port of the extension's in-tab extractor
+// (background.js `fetchAmazonProductViaTab`) so brands come out byte-identical
+// — the search/match logic downstream sees no change in its input.
+
+const BRAND_CONCURRENCY  = Number(process.env.SG_BRAND_CONCURRENCY) || 3;
+const BRAND_REST_MS      = Number(process.env.SG_BRAND_REST_MS) || 45000;
+const BRAND_BLOCK_STRIKES = 5;
+
+let _brandBrowser   = null;
+let _brandContext   = null;
+let _brandLaunching = null;
+let _brandStrikes   = 0;
+let _brandRestUntil = 0;
+let _brandActive    = 0;
+const _brandQueue   = [];
+// cssRescued counts pages where blocking stylesheets hid the byline and the
+// guard re-read recovered it. If this climbs, Amazon has started serving the
+// degraded no-CSS skeleton again and BRAND_BLOCK_FAST should drop 'stylesheet'.
+let _brandStats     = { ok: 0, blocked: 0, empty: 0, cssRescued: 0, errors: 0 };
+
+function _acquireBrandSlot() {
+  return new Promise(resolve => {
+    if (_brandActive < BRAND_CONCURRENCY) { _brandActive++; return resolve(); }
+    _brandQueue.push(resolve);
+  });
+}
+function _releaseBrandSlot() {
+  _brandActive = Math.max(0, _brandActive - 1);
+  const next = _brandQueue.shift();
+  if (next) { _brandActive++; next(); }
+}
+
+async function _closeBrandBrowser() {
+  const c = _brandContext;
+  _brandBrowser = null; _brandContext = null;
+  if (c) await c.close().catch(() => {});
+}
+
+// One PERSISTENT real-Chrome profile, reused across requests AND across server
+// restarts. Both properties are load-bearing, measured against amazon.com:
+//
+//   * Persistent + warmed  → /dp/ returns 200 with the full product page.
+//   * Cold ephemeral ctx   → /dp/ returns **HTTP 202 with an empty body**.
+//
+// The 202 is Amazon's silent bot block. It is NOT a fingerprint problem: it
+// reproduced with real Chrome and navigator.webdriver === false. It is purely
+// about session cookies — a context that has never touched amazon.com gets 202
+// on a direct product-page hit, and the same profile succeeds on the next run
+// once the cookie jar exists. That is why we warm up on the homepage first and
+// why the profile lives on disk instead of being rebuilt every launch.
+//
+// Uses `channel: 'chrome'` (the real installed Chrome), not bundled Chromium,
+// and deliberately does NOT use the stealth plugin or a randomised userAgent:
+// a genuine Chrome profile with its own real UA is the least detectable thing
+// available, and overriding the UA only desynchronises it from the real client
+// hints Chrome sends.
+const BRAND_PROFILE_DIR = process.env.SG_BRAND_PROFILE || path.join(os.homedir(), '.sg-brand-profile');
+
+async function _getBrandContext(domain) {
+  if (_brandContext) return _brandContext;
+  if (_brandLaunching) return _brandLaunching;
+  _brandLaunching = (async () => {
+    try {
+      const proxy = nextProxy();
+      const opts = {
+        channel:     'chrome',
+        headless:    HEADLESS,
+        locale:      SCRAPE_LOCALE,
+        timezoneId:  SCRAPE_TIMEZONE,
+        geolocation: { longitude: SCRAPE_LON, latitude: SCRAPE_LAT },
+        permissions: ['geolocation'],
+        viewport:    { width: 1366 + Math.floor(Math.random() * 200), height: 768 + Math.floor(Math.random() * 100) },
+        extraHTTPHeaders: { 'Accept-Language': 'en-US,en;q=0.9' },
+        args: ['--disable-blink-features=AutomationControlled'],
+      };
+      if (proxy) opts.proxy = proxy;
+      _brandContext = await rawChromium.launchPersistentContext(BRAND_PROFILE_DIR, opts);
+      _brandBrowser = _brandContext.browser();
+      await _brandContext.addCookies([{
+        name: 'x-amz-postal-code', value: SCRAPE_ZIP, domain: '.' + domain, path: '/',
+      }]).catch(() => {});
+      // Resource blocking is applied per-PAGE (see _readPage) rather than here,
+      // so the CSS-degrade guard can re-read a page with a different block list.
+      // Warm the jar on the homepage before any /dp/ hit — see the 202 note above.
+      const warm = await _brandContext.newPage();
+      await warm.goto(`https://www.${domain}/`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await warm.waitForTimeout(2000);
+      await warm.close().catch(() => {});
+      console.log(`🏷️  Brand browser ready — real Chrome, profile ${BRAND_PROFILE_DIR} (concurrency ${BRAND_CONCURRENCY}, headless=${HEADLESS})`);
+      return _brandContext;
+    } finally {
+      _brandLaunching = null;
+    }
+  })();
+  return _brandLaunching;
+}
+
+// VERBATIM port of the extension's in-tab extractor. Keep the two in sync.
+function _extractBrandInPage() {
+  const clean = (t) => (t || '').replace(/\s+/g, ' ').trim()
+    .replace(/^(Brand:|Visit the\s+|by\s+)/i, '')
+    .replace(/\s+Store\s*$/i, '')
+    .replace(/\s*\((Author|Editor|Illustrator|Translator|Contributor|Narrator|Artist|Publisher)[^)]*\).*/i, '')
+    .trim();
+  let brand = '';
+  const garbage = (s) => !s || /[<>"=?/\\{}|]/.test(s) || /\b(class|href|style|nav_|aria|data-)\b/i.test(s) || /https?:|:\/\//i.test(s) || !/[A-Za-z]/.test(s);
+  const pick = (v) => { if (brand) return; const c = clean(v); if (c && c.length > 1 && c.length < 60 && !garbage(c)) brand = c; };
+
+  const by = document.querySelector('#bylineInfo');
+  if (by) pick(by.textContent);
+  if (!brand) { const m = ((document.body && document.body.innerText) || '').match(/Visit the\s+([^\n]+?)\s+Store/i); if (m) pick(m[1]); }
+  if (!brand) { const po = document.querySelector('.po-brand .po-break-word'); if (po) pick(po.textContent); }
+  if (!brand) {
+    document.querySelectorAll('#productDetails_techSpec_section_1 tr, #detailBullets_feature_div li, .a-keyvalue tr, .prodDetTable tr').forEach(row => {
+      if (brand) return;
+      const t = (row.textContent || '').replace(/\s+/g, ' ').trim();
+      const m = t.match(/^Brand\s*Name?\s*[:\-]?\s*(.+)$/i);
+      if (m) pick(m[1]);
+    });
+  }
+  if (!brand) {
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+      if (brand) return;
+      try { const j = JSON.parse(s.textContent); const b = (j.brand && (j.brand.name || j.brand)) || j.manufacturer; if (typeof b === 'string') pick(b); } catch (_) {}
+    });
+  }
+  const titleEl = document.querySelector('#productTitle');
+  const title = (titleEl ? titleEl.textContent : '').trim();
+  const asin = ((location.href.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase();
+  const hasProductMarkers = !!document.querySelector('#productTitle, #centerCol, #ppd, #dp, #detailBullets_feature_div');
+  return { brand, asin, title, hasProductMarkers };
+}
+
+function _isBlockedInPage() {
+  const url   = window.location.href;
+  const title = document.title || '';
+  const text  = (document.body && document.body.innerText) || '';
+  return url.includes('validateCaptcha') ||
+         url.includes('/errors/') ||
+         title.includes('Robot Check') ||
+         /sorry/i.test(title) && title.length < 80 ||
+         text.includes('Type the characters you see in this image') ||
+         text.includes('Enter the characters you see below') ||
+         text.includes('automated access') ||
+         text.includes('CAPTCHA');
+}
+
+// ── Resource blocking ───────────────────────────────────────────────────────
+// FAST is the default and also blocks font + stylesheet. Measured over 12 real
+// ASINs on a warm profile, FAST vs LIGHT returned **byte-identical brand strings
+// on 12/12** and cut 16.8s/item → 9.6s/item (43% faster), all HTTP 200.
+//
+// The caution this overrides is real but belongs to a different mechanism: the
+// EXTENSION blocks CSS via declarativeNetRequest, and there Amazon serves a
+// degraded "Skip to / Keyboard shortcuts" skeleton where #bylineInfo never
+// renders — a false "brand not found". That did not reproduce here. Rather than
+// trust one sample forever, LIGHT is kept as a guard: if a FAST read yields a
+// product page with NO brand, it is re-read once with CSS on. That is the exact
+// shape of the degrade, and it is the expensive failure (a brandless product is
+// classified 'skipped', which is never retried), so it is worth one extra load
+// on the rare pages that hit it. Script is deliberately NOT blocked: it bought
+// only ~8% more and risks both JS-rendered bylines and looking non-human.
+const BRAND_BLOCK_FAST  = ['image', 'media', 'font', 'stylesheet'];
+const BRAND_BLOCK_LIGHT = ['image', 'media'];
+
+async function _readPage(ctx, url, blockList) {
+  const page = await ctx.newPage();
+  try {
+    await page.route('**/*', route =>
+      blockList.includes(route.request().resourceType()) ? route.abort() : route.continue());
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForSelector('#bylineInfo', { timeout: 6000 })
+      .catch(() => page.waitForSelector('#productTitle, #centerCol, #ppd', { timeout: 4000 }).catch(() => {}));
+    const status  = resp ? resp.status() : 0;
+    const blocked = status === 202 || status === 429 || status === 503 ||
+                    await page.evaluate(_isBlockedInPage).catch(() => false);
+    const out = blocked ? null : await page.evaluate(_extractBrandInPage);
+    return { status, blocked, out };
+  } finally {
+    await page.close().catch(() => {});
+  }
+}
+
+async function readBrand(url, domain) {
+  if (Date.now() < _brandRestUntil) {
+    return { blocked: true, resting: true, restMs: _brandRestUntil - Date.now() };
+  }
+  await _acquireBrandSlot();
+  try {
+    const ctx = await _getBrandContext(domain);
+    let { status, blocked, out } = await _readPage(ctx, url, BRAND_BLOCK_FAST);
+
+    // Amazon's silent bot block is an HTTP 202 with an EMPTY body — no CAPTCHA,
+    // no "Sorry" text, nothing for the in-page detector to match. Classifying it
+    // by status is the only way to see it. Getting this wrong is expensive: a 202
+    // scored as "loaded, no brand" marks a real product as a genuine skip and it
+    // never gets retried. 429/503 are the ordinary throttle responses.
+    if (blocked) {
+      if (status === 202 || status === 429 || status === 503) {
+        console.log(`  🚫 Brand read blocked — HTTP ${status} (silent bot block)`);
+      }
+      _brandStats.blocked++;
+      if (++_brandStrikes >= BRAND_BLOCK_STRIKES) {
+        // A real browser being walled means the IP itself is hot — resting and
+        // relaunching with a fresh profile session is the only thing that helps.
+        _brandRestUntil = Date.now() + BRAND_REST_MS;
+        _brandStrikes = 0;
+        console.log(`🧊 Brand browser walled ${BRAND_BLOCK_STRIKES}x — resting ${Math.round(BRAND_REST_MS / 1000)}s and relaunching`);
+        await _closeBrandBrowser();
+      }
+      return { blocked: true };
+    }
+
+    // CSS-degrade guard: a product page that rendered but carries no brand is the
+    // one outcome blocking CSS could plausibly have caused. Pay one re-read with
+    // stylesheets on rather than emit a false "no brand" (→ 'skipped', no retry).
+    if (out && out.hasProductMarkers && !out.brand) {
+      const retry = await _readPage(ctx, url, BRAND_BLOCK_LIGHT);
+      if (retry.out && retry.out.brand) {
+        _brandStats.cssRescued++;
+        console.log(`  🎨 Brand only visible with CSS on — "${retry.out.brand}" (${url.slice(-10)})`);
+        out = retry.out;
+      }
+    }
+
+    _brandStrikes = 0; // a page that rendered is proof the session still works
+    if (out && out.brand) _brandStats.ok++; else _brandStats.empty++;
+    return { blocked: false, ...out };
+  } catch (e) {
+    // Almost always `page.goto: Timeout` from too many parallel pages in one
+    // browser — a capacity problem, NOT an Amazon block, so it must not feed the
+    // wall/strike accounting. Measured: 3 parallel pages are clean, 6 times out
+    // on ~2/3 of reads (and the failures LOOK fast, so raw throughput numbers
+    // flatter a broken setting). If `errors` is climbing, lower concurrency.
+    _brandStats.errors++;
+    console.log(`  ⚠️ Brand read failed (${String(e.message).split('\n')[0].slice(0, 60)})`);
+    return { blocked: false, error: e.message, brand: '', title: '', hasProductMarkers: false };
+  } finally {
+    _releaseBrandSlot();
+  }
+}
+
+// POST /brand { url } | { asin, domain } → { brand, title, asin, hasProductMarkers, blocked }
+app.post('/brand', async (req, res) => {
+  const { url, asin, domain = 'amazon.com' } = req.body || {};
+  if (!ALLOWED_DOMAIN.test(domain)) return res.status(400).json({ error: 'unsupported domain' });
+
+  let target = '';
+  if (typeof url === 'string' && url) {
+    let u;
+    try { u = new URL(url); } catch (_) { return res.status(400).json({ error: 'bad url' }); }
+    // Only ever drive the browser to Amazon — never to an arbitrary host from
+    // the request body. This endpoint launches a real browser; an open redirect
+    // here would make it a general-purpose fetcher for anything on this machine.
+    if (u.protocol !== 'https:' || !ALLOWED_DOMAIN.test(u.hostname.replace(/^www\./, ''))) {
+      return res.status(400).json({ error: 'url must be an https amazon domain' });
+    }
+    target = u.origin + u.pathname;
+  } else if (typeof asin === 'string' && /^[A-Z0-9]{10}$/i.test(asin.trim())) {
+    target = `https://www.${domain}/dp/${asin.trim().toUpperCase()}`;
+  } else {
+    return res.status(400).json({ error: 'url or asin required' });
+  }
+
+  const out = await readBrand(target, domain);
+  res.json(out);
+});
+
+app.get('/brand/stats', (req, res) => {
+  res.json({
+    ..._brandStats,
+    concurrency: BRAND_CONCURRENCY,
+    resting: Date.now() < _brandRestUntil,
+    restMsLeft: Math.max(0, _brandRestUntil - Date.now()),
+    up: !!_brandContext,
+  });
+});
 
 app.post('/stop', (req, res) => {
   const { jobId } = req.body;

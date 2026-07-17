@@ -2176,6 +2176,14 @@ function _amazonWallStrike() {
   if (_wallStrikes >= WALL_BREAKER_STRIKES && Date.now() > _wallBreakerUntil) {
     _wallBreakerUntil = Date.now() + WALL_BREAKER_REST_MS;
     addLog(`  🧊 Amazon wall is persistent (${_wallStrikes} consecutive blocks) — resting ALL Amazon tabs ${Math.round(WALL_BREAKER_REST_MS / 1000)}s so the rate limit clears. Blocked items are queued for auto-retry.`);
+    // v7.1.53: the rest IS the remedy for these strikes, so spend them. Without
+    // this the counter stayed pinned at/above the threshold for the rest of the
+    // run, and the very FIRST blocked tab after a rest re-opened another 90s rest
+    // — the resume could never earn its way back to a clear breaker. Zeroing here
+    // gives the post-rest resume a full 8-strike budget to find a working page
+    // (any success calls _amazonWallClear()), while a genuinely persistent wall
+    // still re-opens the breaker after 8 fresh consecutive blocks.
+    _wallStrikes = 0;
     // v7.1.52: a persistent wall means the current sustainable rate is still too
     // high — ratchet the LEARNED ceiling down 30% (floor at the safe minimum) so
     // the post-rest resume settles lower instead of climbing straight back into
@@ -2715,6 +2723,21 @@ async function processLoop() {
           while (_reloadPending && ST.running) await sleep(200);
           if (!ST.running) break;
 
+          // v7.1.53: WAIT OUT THE WALL REST — do not claim items during it.
+          // While the breaker is open, fetchAmazonProduct() returns blocked without
+          // touching the network and the tab recovery below is skipped, so an item
+          // claimed now costs ~0ms and is guaranteed to end as 'error'. With no gate
+          // here, the workers spun at full speed through the rest and burned ~10
+          // items/second — a single 90s rest chewed through ~900 ASINs and errored
+          // every one of them without issuing one request. That, not the block rate
+          // itself, is what produced a 99% error run. Spin like the two gates above:
+          // the queue must be waiting for Amazon to un-throttle, not draining into it.
+          while (ST.running && Date.now() < _wallBreakerUntil) {
+            setSgGuardCookie(true); // keep the cookie-wiper paused through the rest
+            await sleep(500);
+          }
+          if (!ST.running) break;
+
           myIdx = ST.idx;
           if (myIdx >= ST.queue.length) break;
 
@@ -3005,6 +3028,86 @@ async function maybeAutoRerunSkipped() {
 }
 
 // ═══════════════════════════════════════════════════════════════
+// LOCAL BRAND SERVER (v7.1.53) — the raw-ASIN path
+// ═══════════════════════════════════════════════════════════════
+// A pasted ASIN has no brandHint, so when Amazon walls the product read there
+// is nothing to fall back on and the item can only end as 'error'. Both of the
+// extension's read paths are structurally weak against that wall: the SW fetch
+// cannot set Sec-Fetch/UA/Referer (forbidden headers, dropped in the worker)
+// and leaks an extension Origin, and the helper tabs share the same throttled
+// profile. amazon-playwright-scraper's /brand endpoint drives a real headed
+// Chromium (stealth plugin, genuine TLS fingerprint, warm cookie jar) which
+// reads those same pages while this extension is walled.
+//
+// If the server is not running, everything below no-ops in ~0ms after one probe
+// and the existing fetch/tab path runs exactly as before — starting the server
+// is optional, not required.
+const BRAND_SERVER_URL = 'http://127.0.0.1:3000';
+let _brandServerUp     = null;  // null = unprobed, true/false = last known state
+let _brandServerNextProbe = 0;
+const BRAND_SERVER_REPROBE_MS = 60000;
+
+async function _brandServerAvailable() {
+  const now = Date.now();
+  if (_brandServerUp !== null && now < _brandServerNextProbe) return _brandServerUp;
+  try {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), 1500);
+    const r = await fetch(`${BRAND_SERVER_URL}/brand/stats`, { signal: ctl.signal });
+    clearTimeout(t);
+    const wasUp = _brandServerUp;
+    _brandServerUp = r.ok;
+    _brandServerNextProbe = now + BRAND_SERVER_REPROBE_MS;
+    if (r.ok && wasUp !== true) addLog('  🎭 Local brand browser detected — routing Amazon reads through Playwright');
+    return _brandServerUp;
+  } catch (_) {
+    const wasUp = _brandServerUp;
+    _brandServerUp = false;
+    _brandServerNextProbe = now + BRAND_SERVER_REPROBE_MS;
+    if (wasUp === true) addLog('  ⚠️ Local brand browser went away — falling back to in-extension reads');
+    return false;
+  }
+}
+
+// Returns a fetchAmazonProduct-shaped result, or null when the server is down /
+// resting / errored so the caller falls through to the existing paths.
+async function fetchAmazonProductViaServer(url) {
+  if (!(await _brandServerAvailable())) return null;
+  try {
+    const ctl = new AbortController();
+    // Generous on purpose. The server serialises reads through SG_BRAND_CONCURRENCY
+    // (3) real browser tabs at ~9s each, so with more extension workers than that
+    // a request can legitimately sit in the server's queue for a while. Timing out
+    // early would drop the item back onto the walled fetch/tab path and spend an
+    // Amazon request to produce the error we came here to avoid — waiting is
+    // strictly cheaper. Match "Tabs at once" to SG_BRAND_CONCURRENCY to skip the
+    // queue entirely.
+    const t = setTimeout(() => ctl.abort(), 90000);
+    const r = await fetch(`${BRAND_SERVER_URL}/brand`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url }),
+      signal: ctl.signal,
+    });
+    clearTimeout(t);
+    if (!r.ok) return null;
+    const d = await r.json();
+    // Resting or walled: report a block so the caller's own wall accounting runs.
+    if (d.blocked) return { brand: '', asin: '', title: '', hasProductMarkers: false, hasCaptcha: false, blocked: true };
+    return {
+      brand: d.brand || '',
+      asin:  d.asin  || '',
+      title: d.title || '',
+      hasProductMarkers: !!d.hasProductMarkers,
+      hasCaptcha: false,
+    };
+  } catch (_) {
+    _brandServerUp = null; // force a re-probe next item
+    return null;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
 // CORE ITEM PIPELINE  (v2.0 — unchanged)
 // ═══════════════════════════════════════════════════════════════
 async function processItem(item, mcfg) {
@@ -3015,10 +3118,29 @@ async function processItem(item, mcfg) {
   // ── Step 1: Amazon Product Page → brand name only ─────────────
   addLog('  📦 Amazon product page…');
   try {
+    // ── 1@: Local Playwright brand browser (preferred when running) ────────
+    // Tried FIRST because it is the only path that keeps working once the IP is
+    // walled — and it costs the extension nothing: no tabless fetch, no helper
+    // tab, no Amazon rate token. Its result is deliberately fetchResult-shaped,
+    // so when it answers, every downstream step (tab-recovery gate, brandHint
+    // fallback, skip/error classification, search) runs completely unchanged and
+    // simply sees a product page that loaded. Falls through to the original
+    // pipeline whenever the server is down, resting or walled.
+    const viaServer = await fetchAmazonProductViaServer(item.url);
+    if (viaServer && !viaServer.blocked) {
+      fetchResult = viaServer;
+      if (viaServer.brand) {
+        _amazonWallClear(); // a real page loaded — let the wall accounting know
+        addLog(`  🎭 Brand (local browser): "${viaServer.brand}"`);
+      }
+    } else if (viaServer && viaServer.blocked) {
+      addLog('  🧊 Local brand browser walled/resting — falling back to in-extension read');
+    }
+
     // ── 1a: Direct tabless fetch() of the product HTML (primary path) ──────
     // Parsed by regex (service worker has no DOM). CAPTCHAs/bot-walls return
     // blocked:true; the tab-recovery step (1b) handles those.
-    if (_shouldTryTabless()) {
+    if (!fetchResult && _shouldTryTabless()) {
       try {
         fetchResult = await fetchAmazonProduct(item.url, mcfg.tabTimeout);
       } catch(fe) {
@@ -3032,12 +3154,11 @@ async function processItem(item, mcfg) {
       const _tablessBlocked = !fetchResult || !!fetchResult.blocked ||
         (!fetchResult.brand && !fetchResult.hasProductMarkers);
       _recordTablessOutcome(_tablessBlocked);
-    } else {
+    } else if (!fetchResult) {
       // Tabless read has been reliably walled on this IP/session — skip it and
       // go straight to the real-tab read (step 1b). Saves a blocked request + a
       // rate token per item and stops feeding the per-IP wall. fetchResult stays
       // null so the _fetchBlocked branch below fires the tab recovery.
-      fetchResult = null;
       addLog('  ⏭ Tabless read walling — going straight to real-tab read');
     }
 
@@ -3528,37 +3649,38 @@ async function scrapeAmazonSearch(msg) {
           const items   = [];
           const seenASIN = new Set();
 
+          // v7.1.53: read the raw title + href only. The brand is derived from them
+          // in sgBrandFromTitleSlug() back in the worker, where it is unit-testable
+          // and shared with the market scraper below (this function is serialised
+          // into the page, so it cannot call anything from the worker scope).
+          const sgTitleOf = (card) => {
+            const h2 = card.querySelector('[data-cy="title-recipe"] h2, h2');
+            if (h2 && h2.textContent.trim()) return h2.textContent.trim();
+            const a = card.querySelector('[data-cy="title-recipe"] a, a.a-link-normal[href*="/dp/"]');
+            if (a && a.textContent.trim()) return a.textContent.trim();
+            const img = card.querySelector('img[alt]');
+            const alt = img ? (img.getAttribute('alt') || '').trim() : '';
+            return alt.length > 8 ? alt : '';
+          };
+
           document.querySelectorAll('[data-asin][data-component-type="s-search-result"]').forEach(card => {
             const asin = (card.getAttribute('data-asin') || '').trim();
             if (!asin || asin.length < 5 || seenASIN.has(asin)) return;
             seenASIN.add(asin);
 
+            // Not every card wraps its /dp/ link in .a-link-normal — measured on
+            // /s?k=wireless+earbuds, the stricter selector missed 6 of 22 cards
+            // outright, costing a hint on every one of them.
+            const link = card.querySelector('a.a-link-normal[href*="/dp/"]') ||
+                         card.querySelector('a[href*="/dp/"]');
+            const href = link ? (link.getAttribute('href') || '') : '';
             let url = location.origin + '/dp/' + asin;
-            const link = card.querySelector('a.a-link-normal[href*="/dp/"]');
-            if (link) {
-              const href = link.getAttribute('href') || '';
+            if (href) {
               const clean = href.split('/ref=')[0].split('?')[0];
               if (clean) url = clean.startsWith('http') ? clean : location.origin + clean;
             }
 
-            let brandHint = '';
-            const brandSels = [
-              '.s-line-clamp-1 span',
-              '[data-cy="title-recipe-brand-name"]',
-              '.a-size-base-plus.a-color-base',
-              'span.a-size-base-plus',
-            ];
-            for (const s of brandSels) {
-              const el = card.querySelector(s);
-              if (el && el.textContent.trim()) {
-                brandHint = el.textContent.trim()
-                  .replace(/^Brand:\s*/i,'').split('\n')[0].trim();
-                if (brandHint && brandHint.length > 1 && brandHint.length < 60) break;
-                brandHint = '';
-              }
-            }
-
-            items.push({ asin, url, brandHint });
+            items.push({ asin, url, title: sgTitleOf(card), href });
           });
 
           let nextUrl = null;
@@ -3578,7 +3700,12 @@ async function scrapeAmazonSearch(msg) {
       if (!result) { addLog(`  ⚠️  No result from page ${page}`); break; }
 
       let added = 0;
-      for (const item of (result.items||[])) {
+      for (const raw of (result.items||[])) {
+        const item = {
+          asin: raw.asin,
+          url: raw.url,
+          brandHint: sgBrandFromTitleSlug(raw.title, raw.href),
+        };
         if (skipDupBrand && item.brandHint) {
           const bk = item.brandHint.toLowerCase().trim();
           if (brandHints.has(bk)) continue;
@@ -3733,26 +3860,29 @@ async function scrapeAmazonByKeywords(msg) {
             target: { tabId: pageTid },
             func: () => {
               const items = []; const seenASIN = new Set();
+              // v7.1.53: raw title + href only — brand derived in sgBrandFromTitleSlug().
+              const sgTitleOf = (card) => {
+                const h2 = card.querySelector('[data-cy="title-recipe"] h2, h2');
+                if (h2 && h2.textContent.trim()) return h2.textContent.trim();
+                const a = card.querySelector('[data-cy="title-recipe"] a, a.a-link-normal[href*="/dp/"]');
+                if (a && a.textContent.trim()) return a.textContent.trim();
+                const img = card.querySelector('img[alt]');
+                const alt = img ? (img.getAttribute('alt') || '').trim() : '';
+                return alt.length > 8 ? alt : '';
+              };
               document.querySelectorAll('[data-asin][data-component-type="s-search-result"]').forEach(card => {
                 const asin = (card.getAttribute('data-asin')||'').trim();
                 if (!asin || asin.length < 5 || seenASIN.has(asin)) return;
                 seenASIN.add(asin);
+                const link = card.querySelector('a.a-link-normal[href*="/dp/"]') ||
+                             card.querySelector('a[href*="/dp/"]');
+                const href = link ? (link.getAttribute('href')||'') : '';
                 let url = location.origin + '/dp/' + asin;
-                const link = card.querySelector('a.a-link-normal[href*="/dp/"]');
-                if (link) {
-                  const href = link.getAttribute('href')||'';
+                if (href) {
                   const clean = href.split('/ref=')[0].split('?')[0];
                   if (clean) url = clean.startsWith('http') ? clean : location.origin+clean;
                 }
-                let brandHint = '';
-                for (const s of ['[data-cy="title-recipe-brand-name"]','.s-line-clamp-1 span','span.a-size-base-plus']) {
-                  const el = card.querySelector(s);
-                  if (el?.textContent?.trim()) {
-                    brandHint = el.textContent.trim().replace(/^Brand:\s*/i,'').split('\n')[0].trim().slice(0,60);
-                    if (brandHint) break;
-                  }
-                }
-                items.push({ asin, url, brandHint });
+                items.push({ asin, url, title: sgTitleOf(card), href });
               });
               let nextUrl = null;
               const nb = document.querySelector('.s-pagination-next[href]:not(.s-pagination-disabled),a[aria-label="Go to next page"][href]');
@@ -3768,7 +3898,12 @@ async function scrapeAmazonByKeywords(msg) {
             gotCards = true;
             kwPagesScraped++;
             let added = 0;
-            for (const item of result.items) {
+            for (const raw of result.items) {
+              const item = {
+                asin: raw.asin,
+                url: raw.url,
+                brandHint: sgBrandFromTitleSlug(raw.title, raw.href),
+              };
               if (skipDupBrand && item.brandHint) {
                 const bk = item.brandHint.toLowerCase().trim();
                 if (brandHints.has(bk)) continue;
@@ -4299,6 +4434,95 @@ function _domainIsFullBrand(url, brand) {
     if (hostRoot.length >= 6 && bnSlug.includes(hostRoot) && hostRoot.length / bnSlug.length >= 0.75) return true;
     return false;
   } catch (_) { return false; }
+}
+
+// v7.1.53: recover a brand hint from an Amazon search card's title + /dp/ href.
+//
+// Amazon removed the brand element from search result cards: the selectors the
+// scraper used ([data-cy="title-recipe-brand-name"], .s-line-clamp-1 span) now
+// match nothing, and .a-size-base-plus.a-color-base returns the product TITLE.
+// Measured live on /s?k=water+bottle (48 real cards): the old chain produced a
+// hint on 6% of them, and those were badges like "Amazon's Choice: Overall Pick"
+// — searched as if they were brands. This scores 85% on the same page.
+//
+// The hint is load-bearing well past the scrape: processItem() only marks an item
+// 'error' ("Amazon page blocked — brand unread") when it ends up with NO brand,
+// and brandHint is the fallback that fills it. With no hint, every blocked Amazon
+// read is a hard error instead of a search.
+//
+// Method: the /dp/ slug is Amazon's own hyphenated rendering of the title's
+// opening words, so the leading run of tokens the two AGREE on is the brand (plus
+// at most a product-line word). Requiring that agreement is what keeps junk out —
+// a badge or a stray span never matches the slug. Capped at 2 tokens so multi-word
+// brands ("Hydro Flask") survive without swallowing the description.
+//
+// The two lists below do different jobs and must not be merged:
+//   SG_BRAND_STOPWORD — words that are never a brand's first token. Hitting one
+//     yields no hint at all, which is the safe outcome (see the note above about
+//     a wrong hint suppressing the retryable 'error' path).
+//   SG_BRAND_DESCRIPTOR — words that end the brand when they appear SECOND
+//     ("DYSANKY Insulated…" → DYSANKY). Deliberately excludes nouns that are
+//     themselves common brand components ("flask" → Hydro Flask, "logic" → Case
+//     Logic); a descriptor list tuned on one category silently truncates real
+//     brands in another, so it stays limited to adjectives/measures.
+const SG_BRAND_STOPWORD   = /^(the|a|an|and|or|for|with|by|new|pack|set|of|from|all|best|top|amazon's|choice)$/i;
+const SG_BRAND_DESCRIPTOR = /^(insulated|stainless|steel|water|premium|portable|reusable|sports|gym|travel|leak|proof|bpa|free|large|small|kids|men|women|tiny|micro|thick|double|wall|vacuum|wide|mouth|oz|ounce|pack|set|organic|natural|wireless|rechargeable|adjustable|heavy|duty|professional|original)$/i;
+function sgBrandFromTitleSlug(title, href) {
+  if (!title || typeof title !== 'string') return '';
+  const slug = String(href || '').split('/dp/')[0].split('/').filter(Boolean).pop() || '';
+  let slugToks = [];
+  try { slugToks = decodeURIComponent(slug).split('-').filter(Boolean); }
+  catch (_) { slugToks = slug.split('-').filter(Boolean); }
+  if (!slugToks.length) return '';
+  const norm = (s) => s.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const clean = (s) => s.replace(/[,:;|].*$/, '').trim().replace(/[^A-Za-z0-9'&.\-]/g, '');
+  // Compare on a crude stem so "Bottles" in the slug is recognised as the title's
+  // "Bottle" — a substring test misses that and lets the plural through as a brand.
+  const stem = (s) => norm(s).replace(/s$/, '');
+  const tToks = title.trim().split(/\s+/);
+  const out = [];
+
+  if (norm(tToks[0]) && norm(tToks[0]) === norm(slugToks[0])) {
+    // Case 1 — the title leads with the brand and the slug agrees. Walk the run
+    // of tokens they share; that run is the brand plus at most a product line.
+    let run = 0;
+    while (run < tToks.length && run < slugToks.length &&
+           norm(tToks[run]) && norm(tToks[run]) === norm(slugToks[run])) run++;
+    for (let i = 0; i < Math.min(run, 2); i++) {
+      const w = clean(tToks[i]);
+      if (!w) break;
+      // A descriptor leading BOTH title and slug ("Water Bottle 32oz" with slug
+      // /Water-Bottle-32oz/) means Amazon had no brand to put first — the token is
+      // the category, not a brand, so emit nothing rather than a junk hint.
+      if (i === 0 && (SG_BRAND_STOPWORD.test(w) || SG_BRAND_DESCRIPTOR.test(w))) break;
+      if (i > 0) {
+        if (!/^[A-Z0-9]/.test(w)) break;          // 2nd token only if it reads as a proper noun
+        if (SG_BRAND_DESCRIPTOR.test(w)) break;   // "DYSANKY Insulated" → DYSANKY
+        if (SG_BRAND_STOPWORD.test(w)) break;
+      }
+      out.push(w);
+    }
+  } else {
+    // Case 2 — the SEO-stuffed title leads with the category ("Wireless Earbuds,
+    // Bluetooth 5.3 Headphones…") and omits the brand entirely, but Amazon still
+    // builds the slug as brand + title words. So a slug token that appears NOWHERE
+    // in the title can only have come from the brand field. Measured on
+    // /s?k=wireless+earbuds, this splits perfectly: absent-from-title gave Fhumsh,
+    // HUASEMI, GNMN (all real brands) while present-in-title gave Headphones,
+    // Bluetooth, Conduction (all category words). It needs no category word list,
+    // which is what keeps it honest across categories.
+    const titleStems = new Set(tToks.map(stem).filter(Boolean));
+    for (let i = 0; i < Math.min(slugToks.length, 2); i++) {
+      const w = clean(slugToks[i]);
+      if (!w || w.length < 2) break;
+      if (titleStems.has(stem(w))) break;         // a title word, not the brand
+      if (SG_BRAND_STOPWORD.test(w) || SG_BRAND_DESCRIPTOR.test(w)) break;
+      out.push(w);
+    }
+  }
+
+  const brand = out.join(' ').trim();
+  return (brand.length < 2 || brand.length > 40) ? '' : brand;
 }
 
 function domainMatchesBrand(url, brand) {

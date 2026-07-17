@@ -18,10 +18,13 @@ const assembled = [
   extractDeclaration(src, 'BLACKLIST', /^\]\);$/),
   extractDeclaration(src, 'SG_JUNK_RE', /;$/),
   extractDeclaration(src, 'JUNK_BRAND_NAMES', /^\]\);$/),
+  extractDeclaration(src, 'SG_BRAND_STOPWORD', /;$/),
+  extractDeclaration(src, 'SG_BRAND_DESCRIPTOR', /;$/),
   'const MODES = { balanced: { verify: false }, aggressive: { verify: true } };',
   'let ST = { mode: "balanced" };',
   'let processedWebsites = new Set();',
   extractFunction(src, 'isBlacklisted'),
+  extractFunction(src, 'sgBrandFromTitleSlug'),
   extractFunction(src, 'domainMatchesBrand'),
   extractFunction(src, 'brandDomainResemblance'),
   extractFunction(src, 'toRootUrl'),
@@ -34,7 +37,7 @@ const assembled = [
   extractFunction(src, 'validateResult'),
   'const RUNTIME_SNAPSHOT_MAX_AGE_MS = 600000;',
   extractFunction(src, '_runtimeSnapshotIsFresh'),
-  'module.exports = { _parseAmazonHtml, pickSearchCandidate, brandDomainResemblance, domainMatchesBrand, validateResult, _runtimeSnapshotIsFresh };',
+  'module.exports = { _parseAmazonHtml, pickSearchCandidate, brandDomainResemblance, domainMatchesBrand, validateResult, _runtimeSnapshotIsFresh, sgBrandFromTitleSlug };',
 ].join('\n\n');
 
 const {
@@ -44,7 +47,116 @@ const {
   domainMatchesBrand,
   validateResult,
   _runtimeSnapshotIsFresh,
+  sgBrandFromTitleSlug,
 } = compileModule(assembled, BG_PATH);
+
+// ── sgBrandFromTitleSlug (v7.1.53) ──────────────────────────────────────────
+// Fixtures are real title/href pairs captured from a live amazon.com/s page.
+// Amazon's search cards no longer carry a brand element, so the hint is
+// recovered from the leading tokens the title and the /dp/ slug agree on.
+test('sgBrandFromTitleSlug: single-token brand from title + slug agreement', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'Owala FreeSip Insulated Stainless Steel Water Bottle',
+    '/Owala-Insulated-Stainless-Steel-Push-Button-24-Ounce/dp/B085DTZQNZ/ref=sr_1_1'
+  ), 'Owala');
+});
+
+test('sgBrandFromTitleSlug: all-caps brand', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'POWCAN 26 oz Insulated Water Bottle with 2-in-1 Lid',
+    '/POWCAN-Insulated-Bottle-Leak-Proof-Stainless/dp/B0D8J2ZB8P/ref=sr_1_5'
+  ), 'POWCAN');
+});
+
+test('sgBrandFromTitleSlug: two-token brand survives', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'Hydro Flask Wide Mouth Bottle',
+    '/Hydro-Flask-Wide-Mouth-Bottle/dp/B07BSDLK4G'
+  ), 'Hydro Flask');
+});
+
+test('sgBrandFromTitleSlug: stops at a generic product word', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'DYSANKY Insulated Water Bottle | Thick Wall',
+    '/DYSANKY-Insulated-Water-Bottle-Thick/dp/B0ABC12345'
+  ), 'DYSANKY');
+});
+
+// Case 2: SEO-stuffed titles that lead with the category. Real fixtures from a
+// live /s?k=wireless+earbuds page — the brand survives only in the /dp/ slug.
+test('sgBrandFromTitleSlug: SEO title, brand recovered from slug', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'Wireless Earbuds, Bluetooth 5.3 Headphones HiFi Stereo 50H Playtime',
+    '/Fhumsh-Bluetooth-Headphones-Waterproof/dp/B0D1234567'
+  ), 'Fhumsh');
+});
+
+test('sgBrandFromTitleSlug: SEO title, slug brand stops at the first title word', () => {
+  // "Submarine" appears in the title, so it is a title word, not part of the brand.
+  assert.equal(sgBrandFromTitleSlug(
+    'Wireless Earbuds Cute Mini Submarine Design, Lightweight in-Ear',
+    '/HUASEMI-Submarine-Lightweight-Headphones/dp/B0D7654321'
+  ), 'HUASEMI');
+});
+
+test('sgBrandFromTitleSlug: SEO title, a category-word slug is NOT a brand', () => {
+  // "Headphones"/"Bluetooth" lead these slugs but also appear in the title —
+  // that is the tell that they came from the title, not the brand field.
+  assert.equal(sgBrandFromTitleSlug(
+    'Wireless Earbuds Bluetooth 5.3 Sport Headphones with Earhooks',
+    '/Headphones-Waterproof-Lightweight-Sport/dp/B0D1111111'
+  ), '');
+  assert.equal(sgBrandFromTitleSlug(
+    'Wireless Earbuds, Bluetooth 5.4 Headphones Bass Stereo, Ear Buds',
+    '/Bluetooth-Headphones-Stereo-Earbuds/dp/B0D2222222'
+  ), '');
+});
+
+test('sgBrandFromTitleSlug: SEO title, two-token slug brand survives', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'Water Bottle 32oz Vacuum Flask Leak Proof',
+    '/Simple-Modern-Water-Bottle-Vacuum/dp/B0D3333333'
+  ), 'Simple Modern');
+});
+
+test('sgBrandFromTitleSlug: a plural slug word matching a singular title word is not a brand', () => {
+  // Real pair from the live page. "Bottles" leads the slug and the title says
+  // "Bottle" — a substring check misses the plural and emits "Bottles" as a brand.
+  // Better no hint than a wrong one: a hint suppresses the retryable 'error' path.
+  assert.equal(sgBrandFromTitleSlug(
+    'Micro Water Bottle,4oz, Tiny Water Bottle, Mini Bottle',
+    '/Bottles-Stainless-Insulated-Pocket-Size/dp/B0XYZ98765'
+  ), '');
+});
+
+test('sgBrandFromTitleSlug: a descriptor leading both title and slug is not a brand', () => {
+  assert.equal(sgBrandFromTitleSlug(
+    'Water Bottle 32oz Vacuum Insulated',
+    '/Water-Bottle-32oz-Vacuum/dp/B0D4444444'
+  ), '');
+});
+
+test('sgBrandFromTitleSlug: a badge never becomes a brand', () => {
+  // The old selector chain returned "Amazon's Choice: Overall Pick" verbatim as
+  // the brand and searched for it.
+  assert.equal(sgBrandFromTitleSlug(
+    "Amazon's Choice: Overall Pick",
+    '/Amazons-Choice-Overall-Pick/dp/B085DTZQNZ'
+  ), '');
+});
+
+test('sgBrandFromTitleSlug: missing title or href is safe', () => {
+  assert.equal(sgBrandFromTitleSlug('', '/Owala-Bottle/dp/B085DTZQNZ'), '');
+  assert.equal(sgBrandFromTitleSlug('Owala FreeSip Bottle', ''), '');
+  assert.equal(sgBrandFromTitleSlug(null, null), '');
+});
+
+test('sgBrandFromTitleSlug: percent-encoded slug does not throw', () => {
+  assert.doesNotThrow(() => sgBrandFromTitleSlug(
+    'Micro Water Bottle, Tiny',
+    '/Bottles-Insulated%EF%BC%8CPocket-Pocket%E2%80%91Size/dp/B0D1234567'
+  ));
+});
 
 // ── domainMatchesBrand ──────────────────────────────────────────────────────
 test('domainMatchesBrand: root contains the brand name', () => {
