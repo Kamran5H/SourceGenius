@@ -568,10 +568,32 @@ async function runScrapeJob({ jobId, cleanKeywords, pages, domain, jobFolder, fi
 // They all still share ONE IP. Profiles do not buy per-IP rate budget, so this
 // scales until Amazon's per-IP ceiling bites, not indefinitely.
 const BRAND_BROWSERS     = Number(process.env.SG_BRAND_BROWSERS) || 3;
-const BRAND_CONCURRENCY  = Number(process.env.SG_BRAND_CONCURRENCY) || 3; // pages PER browser
+// Pages PER browser. 2, not 3 — measured on 96 real ASINs, twice:
+//
+//   3 pages (9 in flight): 850/hr,  95/96 brands, 1.0% errors, 20 goto timeouts
+//   2 pages (6 in flight): 1168/hr, 96/96 brands, 0.0% errors,  0 goto timeouts
+//
+// Fewer pages is FASTER, which is not the intuition. Oversubscribing a browser
+// does not queue politely: pages stall past the 30s goto ceiling, and each stall
+// wastes half a minute of a worker AND burns retries on a page that would have
+// loaded fine. Removing 20 such stalls bought more than the extra parallelism
+// ever did. Raising this looks like more throughput and measures as less.
+const BRAND_CONCURRENCY  = Number(process.env.SG_BRAND_CONCURRENCY) || 2;
 const BRAND_REST_MS      = Number(process.env.SG_BRAND_REST_MS) || 45000;
 const BRAND_BLOCK_STRIKES = 5;
-const BRAND_TRIES        = 2; // attempts per ASIN, each on a different browser
+// Attempts per ASIN, each on a DIFFERENT browser. A 161-read soak with 2 tries
+// left 1.2% blocked; the third try exists to close that gap, and it is cheap
+// because it only runs for a URL that has already failed twice.
+const BRAND_TRIES        = 3;
+// Navigation timeout. 30s, and do NOT lower it: "fail fast and retry" was tried
+// and measured, and it is strictly worse here. At 15s the soak produced 3.57
+// internal timeouts PER READ (vs 0.29 at 30s) and stalled at 7 reads — under
+// pool load an Amazon product page legitimately takes longer than 15s, so a
+// short ceiling times out nearly everything, burns all BRAND_TRIES attempts on
+// pages that would have loaded, and collapses throughput. These timeouts are a
+// capacity/stall problem, NOT an Amazon block, so they must never feed the
+// strike accounting. If `errors` climbs, lower SG_BRAND_CONCURRENCY instead.
+const BRAND_GOTO_MS      = Number(process.env.SG_BRAND_GOTO_MS) || 30000;
 
 // One entry per browser instance.
 const _pool = Array.from({ length: BRAND_BROWSERS }, (_, i) => ({
@@ -764,7 +786,7 @@ async function _readPage(ctx, url, blockList) {
   try {
     await page.route('**/*', route =>
       blockList.includes(route.request().resourceType()) ? route.abort() : route.continue());
-    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: BRAND_GOTO_MS });
     await page.waitForSelector('#bylineInfo', { timeout: 6000 })
       .catch(() => page.waitForSelector('#productTitle, #centerCol, #ppd', { timeout: 4000 }).catch(() => {}));
     const status  = resp ? resp.status() : 0;
@@ -802,6 +824,7 @@ async function _attemptRead(w, url, domain) {
         console.log(`🧊 Brand browser #${w.id} walled ${BRAND_BLOCK_STRIKES}x — resting ${Math.round(BRAND_REST_MS / 1000)}s and relaunching`);
         await _closeWorker(w);
       }
+      w._lastFail = 'blocked';
       return null;
     }
 
@@ -826,6 +849,7 @@ async function _attemptRead(w, url, domain) {
     // on ~2/3 of reads (and failures LOOK fast, so raw throughput flatters a
     // broken setting). If `errors` climbs, lower SG_BRAND_CONCURRENCY.
     _brandStats.errors++;
+    w._lastFail = 'error';
     console.log(`  ⚠️ #${w.id} read failed (${String(e.message).split('\n')[0].slice(0, 60)})`);
     return null;
   }
@@ -834,6 +858,7 @@ async function _attemptRead(w, url, domain) {
 async function readBrand(url, domain) {
   let out = null;
   let lastId = -1;
+  let lastFail = null;
   // Retry on a DIFFERENT browser. A block is per-profile, so the second profile
   // usually reads the same page fine — that retry is what keeps a blocked read
   // from becoming an extension 'error', which is the whole error story for raw
@@ -842,7 +867,9 @@ async function readBrand(url, domain) {
     const w = await _acquireWorker(attempt > 1 ? lastId : -1);
     lastId = w.id;
     try {
+      w._lastFail = null;
       out = await _attemptRead(w, url, domain);
+      if (!out) lastFail = w._lastFail;
     } finally {
       _releaseWorker(w);
     }
@@ -850,9 +877,14 @@ async function readBrand(url, domain) {
   }
 
   if (!out) {
-    // Every browser failed this URL. Report blocked so the extension runs its own
-    // wall accounting and queues the item for its retry rounds.
-    return { blocked: true };
+    // Every browser failed this URL — but WHY matters. A soak over 96 real ASINs
+    // recorded blocked=0 server-side while the client still saw a 1% "blocked"
+    // rate: every one of those was a goto timeout (pool contention), not Amazon.
+    // Reporting them identically hides the difference between "Amazon is walling
+    // us" (back off) and "my pool is oversubscribed" (lower SG_BRAND_CONCURRENCY),
+    // which are opposite fixes. `blocked` stays true either way so the extension
+    // still falls back and re-queues, but the reason is now on the record.
+    return { blocked: true, reason: lastFail === 'blocked' ? 'amazon-block' : 'pool-timeout' };
   }
 
   if (out.brand) _brandStats.ok++; else _brandStats.empty++;
