@@ -1011,6 +1011,7 @@ async function doStart(msg) {
   await enableTextOnlyMode().catch(() => {});
   await enableAmazonScrapeMode().catch(() => {});
   _cookieWipeWarned = false;                 // v7.1.29: re-arm the wipe warning per run
+  _lastCookieReseedAt = 0;                   // v7.1.54: allow an immediate re-seed this run
   await snapshotAmazonCookies().catch(() => {}); // capture the current good Amazon session
   ST.running = true; ST.paused = false;
   _broadcastResultsLen = ST.results.length; // reset delta tracking for this run
@@ -1091,8 +1092,16 @@ async function doSaveProfile(profile) {
 }
 
 function buildStatus() {
+  // v7.1.54: report `total` derived from the LIVE queue, not the snapshot taken
+  // when ST.stats was last zeroed. Several paths replace/extend ST.queue without
+  // touching ST.stats.total (keyword-scrape handoff, auto-rerun rounds), which
+  // left the panel showing "10627/2641 (402%)" — done tracking the real run while
+  // total was frozen at an earlier round's size. Deriving here makes >100%
+  // structurally impossible. Fall back to the stored total once the queue has
+  // been drained/cleared at finalization so the summary still reads correctly.
+  const stats = { ...ST.stats, total: ST.queue.length || ST.stats.total };
   return { running:ST.running, paused:ST.paused, mode:ST.mode,
-           stats:ST.stats, idx:ST.idx, qLen:ST.queue.length,
+           stats, idx:ST.idx, qLen:ST.queue.length,
            resultsLen:ST.results.length, // AUDIT-FIX: lets the panel skip full getResults fetches when nothing changed
            logs:LOGS.slice(-80), logsTotal:LOGS.length, current:ST.queue[ST.idx]||null,
            cfg:ST.cfg, scrapeProgress:ST.scrapeProgress,
@@ -1244,6 +1253,8 @@ async function setAmazonZipCookie() {
 // wiper and Source Genius coexist; Amazon stays logged-in for our requests.
 let _amazonCookieSnapshot = null;   // last known-good Amazon cookie set
 let _cookieWipeWarned     = false;  // warn the panel only once per run
+let _lastCookieReseedAt   = 0;      // v7.1.54: throttle guard-driven session re-seeds
+const COOKIE_RESEED_GAP_MS = 60000; // one re-seed per minute at most (it opens a tab)
 
 // Re-set a single cookie from a snapshot record (handles httpOnly/secure/sameSite).
 async function _restoreAmazonCookie(c) {
@@ -1305,8 +1316,27 @@ async function guardAmazonCookies() {
       await setAmazonZipCookie().catch(() => {}); // belt-and-suspenders
       addLog('  🛡️ Amazon session was cleared by another extension — restored automatically');
     } else {
-      await setAmazonZipCookie().catch(() => {}); // no snapshot yet — at least keep geo
-      addLog('  🛡️ Amazon cookies cleared by another extension (no snapshot yet to restore)');
+      await setAmazonZipCookie().catch(() => {}); // at least keep geo
+      // v7.1.54: MINT a session instead of just logging that we have none.
+      // Every snapshotAmazonCookies() recapture site sits on a SUCCESS path (a
+      // parsed tabless fetch, a good tab load). rotateIdentityThrottled() nukes
+      // the snapshot on any block. So once a run is fully walled the sequence
+      // deadlocks: wiper kills session-id → no snapshot to restore → every read
+      // is anonymous-cold → every read blocks → no success path → no recapture.
+      // The guard logged "no snapshot yet to restore" every 12s while the run
+      // burned itself down (2539 errors in one observed run). Seeding opens one
+      // real tab to the marketplace root, which mints a fresh session-id and
+      // snapshots it — breaking the loop without needing a product read to work.
+      // Throttled to once/60s, and never during a wall rest (the whole point of
+      // the rest is zero Amazon traffic; the resume re-seeds on the next tick).
+      const now = Date.now();
+      if (now - _lastCookieReseedAt >= COOKIE_RESEED_GAP_MS && now >= _wallBreakerUntil) {
+        _lastCookieReseedAt = now;
+        addLog('  🛡️ Amazon cookies cleared and no snapshot held — re-seeding a fresh session…');
+        await seedAmazonSession().catch(() => {});
+      } else {
+        addLog('  🛡️ Amazon cookies cleared by another extension (no snapshot yet to restore)');
+      }
     }
     if (!_cookieWipeWarned) {
       _cookieWipeWarned = true;
@@ -2745,11 +2775,28 @@ async function processLoop() {
           // every one of them without issuing one request. That, not the block rate
           // itself, is what produced a 99% error run. Spin like the two gates above:
           // the queue must be waiting for Amazon to un-throttle, not draining into it.
+          let _restedOnWall = false;
           while (ST.running && Date.now() < _wallBreakerUntil) {
+            _restedOnWall = true;
             setSgGuardCookie(true); // keep the cookie-wiper paused through the rest
             await sleep(500);
           }
           if (!ST.running) break;
+
+          // v7.1.54: don't resume as a thundering herd. Every worker's rest ends
+          // on the same millisecond, so all N re-entered Amazon inside the same
+          // ~200ms and re-tripped the per-IP limit almost immediately — an
+          // observed rest ended 17:21:13 and seven items fired in that one
+          // second, all walled. Two things before claiming again:
+          //   1. Make sure a session exists. The rest is exactly when the wiper
+          //      wins uncontested, so the resume otherwise reads on a cold jar,
+          //      which Amazon answers with the silent 202 + empty body.
+          //   2. Spread the restart over a couple of seconds.
+          if (_restedOnWall) {
+            await guardAmazonCookies().catch(() => {});
+            await sleep(Math.floor(Math.random() * 2500));
+            if (!ST.running) break;
+          }
 
           myIdx = ST.idx;
           if (myIdx >= ST.queue.length) break;
@@ -3070,33 +3117,59 @@ const BRAND_SERVER_URL = 'http://127.0.0.1:3000';
 let _brandServerUp     = null;  // null = unprobed, true/false = last known state
 let _brandServerNextProbe = 0;
 const BRAND_SERVER_REPROBE_MS = 60000;
+// v7.1.54: a FAILED probe must not be cached like a successful one. Measured on a
+// live run: server-side stats read ok:1094 blocked:0 errors:0 with the pool only
+// 4/6 busy and ZERO waiters, while the extension log was full of Amazon bot-walls.
+// Amazon was not blocking the local browser at all — the extension just wasn't
+// asking it. One probe that missed the old 1500ms deadline pinned _brandServerUp
+// false for a full 60s, and every item in that window bypassed a perfectly healthy
+// real-Chrome reader and went into the walled tabless/tab path instead. At 20
+// workers fanning out DNS probes and 6 search engines, the service worker misses a
+// 1500ms localhost turnaround routinely, so the run spent most of its life blind.
+// Fix: generous localhost deadline, and cache DOWN briefly while caching UP long.
+const BRAND_SERVER_PROBE_MS   = 6000; // localhost — no reason to be tight
+const BRAND_SERVER_DOWN_MS    = 5000; // re-check a "down" verdict aggressively
 
 async function _brandServerAvailable() {
   const now = Date.now();
   if (_brandServerUp !== null && now < _brandServerNextProbe) return _brandServerUp;
   try {
     const ctl = new AbortController();
-    const t = setTimeout(() => ctl.abort(), 1500);
+    const t = setTimeout(() => ctl.abort(), BRAND_SERVER_PROBE_MS);
     const r = await fetch(`${BRAND_SERVER_URL}/brand/stats`, { signal: ctl.signal });
     clearTimeout(t);
     const wasUp = _brandServerUp;
     _brandServerUp = r.ok;
-    _brandServerNextProbe = now + BRAND_SERVER_REPROBE_MS;
+    _brandServerNextProbe = now + (r.ok ? BRAND_SERVER_REPROBE_MS : BRAND_SERVER_DOWN_MS);
     if (r.ok && wasUp !== true) addLog('  🎭 Local brand browser detected — routing Amazon reads through Playwright');
     return _brandServerUp;
   } catch (_) {
     const wasUp = _brandServerUp;
     _brandServerUp = false;
-    _brandServerNextProbe = now + BRAND_SERVER_REPROBE_MS;
-    if (wasUp === true) addLog('  ⚠️ Local brand browser went away — falling back to in-extension reads');
+    _brandServerNextProbe = now + BRAND_SERVER_DOWN_MS;
+    // Log on EVERY transition to down, not only from a known-up state. After a
+    // service-worker restart _brandServerUp is null, so the old `wasUp === true`
+    // test stayed silent and the local browser switched itself off invisibly —
+    // the single hardest thing to spot in the panel, because the run looks
+    // identical except that every read is suddenly blocked.
+    if (wasUp !== false) addLog('  ⚠️ Local brand browser probe failed — falling back to in-extension reads (retrying shortly)');
     return false;
   }
 }
 
 // Returns a fetchAmazonProduct-shaped result, or null when the server is down /
 // resting / errored so the caller falls through to the existing paths.
+let _brandServerLastOk = 0; // v7.1.54: when a real read last came back from the server
+
 async function fetchAmazonProductViaServer(url) {
-  if (!(await _brandServerAvailable())) return null;
+  // v7.1.54: a recent SUCCESSFUL READ outranks a failed health probe. The probe is
+  // a convenience, not the authority — the read below carries its own 90s deadline
+  // and returns null on any failure, so trying it costs nothing but a localhost
+  // round-trip, while skipping it costs a real Amazon request into a walled IP.
+  // Without this, one flaky probe still diverted traffic to the wall even though
+  // the previous item had just been served fine by the same process.
+  const _recentlyServed = Date.now() - _brandServerLastOk < 120000;
+  if (!_recentlyServed && !(await _brandServerAvailable())) return null;
   try {
     const ctl = new AbortController();
     // Generous on purpose. The server serialises reads through SG_BRAND_CONCURRENCY
@@ -3116,6 +3189,9 @@ async function fetchAmazonProductViaServer(url) {
     clearTimeout(t);
     if (!r.ok) return null;
     const d = await r.json();
+    // The server answered — it is demonstrably up, whatever the last probe said.
+    _brandServerLastOk = Date.now();
+    _brandServerUp = true;
     // Resting or walled: report a block so the caller's own wall accounting runs.
     if (d.blocked) return { brand: '', asin: '', title: '', hasProductMarkers: false, hasCaptcha: false, blocked: true };
     return {
