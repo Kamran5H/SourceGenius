@@ -793,7 +793,7 @@ function loadCfg() {
     if ($('c-email-verification'))   $('c-email-verification').checked   = !!r.cfg.emailVerification;
     if ($('c-lwf') && r.cfg.liveWriteFilter) $('c-lwf').value = r.cfg.liveWriteFilter;
     // v7.1.15: reflect the saved "tabs at once" value in the slider + number box
-    if (typeof _setParTabsUI === 'function') _setParTabsUI(r.cfg.parallelTabs != null ? r.cfg.parallelTabs : 20);
+    if (typeof _setParTabsUI === 'function') _setParTabsUI(r.cfg.parallelTabs != null ? r.cfg.parallelTabs : 10);
     // Shared-connection instance count (copies on the same public IP)
     if ($('shared-instances')) $('shared-instances').value = Math.max(1, Math.min(8, parseInt(r.cfg.sharedInstances, 10) || 1));
   });
@@ -818,7 +818,7 @@ function getCfg() {
     searchDelay:        sDelay,
     workMode:           currentWorkMode,
     captchaWait:        parseInt($('captcha-wait-slider')?.value) || 90,
-    parallelTabs:       _clampTabs($('partabs-num')?.value || 20),  // v7.1.15
+    parallelTabs:       _clampTabs($('partabs-num')?.value || 10),  // v7.1.15
     sharedInstances:    Math.max(1, Math.min(8, parseInt($('shared-instances')?.value, 10) || 1)), // copies on same IP
     fallbackSearch:     fb,
     autoDeleteNotFound: $('c-autodel-notfound')?.checked || false,
@@ -5771,7 +5771,13 @@ function renderMarketBar() {
 }
 
 // v7.1.15: Parallel Tabs sliders / input box handling
-function _clampTabs(v) { v = parseInt(v, 10); if (!(v > 0)) v = 2; return Math.max(1, Math.min(500, v)); }
+// v7.1.54: clamp to 10, matching the input's own max="10" and the label's
+// "hard capped at 10". The old 500 ceiling let a stored value (default 20) sit in
+// the box above the advertised cap — the panel showed "Tabs at once: 20" under a
+// caption promising 1–10. Background already clamps Amazon website-find
+// concurrency to 10 (getWebsiteFindConcurrency), so the extra headroom only ever
+// reached keyword-scrape parallelism (getParallelTabs, still 1–500 internally).
+function _clampTabs(v) { v = parseInt(v, 10); if (!(v > 0)) v = 2; return Math.max(1, Math.min(10, v)); }
 
 function _setParTabsUI(v) {
   v = _clampTabs(v);

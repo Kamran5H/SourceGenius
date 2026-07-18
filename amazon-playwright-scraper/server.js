@@ -57,13 +57,13 @@ const ALLOWED_DOMAIN = /^amazon\.(com|co\.uk|ca|de|fr|co\.jp|com\.au|es|it|nl)$/
 // Higher CONCURRENCY = faster scraping but more parallel Amazon requests from
 // this IP, which raises block risk. 1 is the safe default; raise it only if
 // you have proxy rotation or accept a higher block rate.
-const CONCURRENCY      = Number(process.env.SG_CONCURRENCY) || 1;
+const CONCURRENCY      = Number(process.env.SG_CONCURRENCY) || 10;
 // Headed (visible) Chrome windows are the current default — headless is more
 // detectable to Amazon's bot checks, so this is opt-in, not opt-out.
-const HEADLESS         = process.env.SG_HEADLESS === 'true';
-const BATCH_DELAY      = 3000;  // ms cooldown between batches
-const RESET_WAIT_MIN   = 30000; // ms min wait after block before relaunch
-const RESET_WAIT_MAX   = 60000; // ms max wait
+const HEADLESS         = process.env.SG_HEADLESS !== 'false'; // default to headless for speed
+const BATCH_DELAY      = 0;  // ms cooldown between batches
+const RESET_WAIT_MIN   = 3000; // ms min wait after block before relaunch
+const RESET_WAIT_MAX   = 8000; // ms max wait
 const SAVE_FOLDER      = process.env.SG_SAVE_FOLDER || path.join(os.homedir(), 'Scrapped');
 
 // ── Simulated shopper location ──────────────────────────────────────────────
@@ -187,8 +187,8 @@ async function withRefreshOnFail(page, fn, label) {
 // ── Scrape one keyword across maxPages, reusing a single page ─────────────
 // Returns { items: [...], blocked: bool }
 async function scrapeKeyword(page, kw, domain, maxPages, shouldStop) {
-  // Random jitter before hitting Amazon — 5–8s to avoid IP flagging
-  await page.waitForTimeout(5000 + Math.floor(Math.random() * 3000));
+  // Random jitter before hitting Amazon — much faster
+  await page.waitForTimeout(1000 + Math.floor(Math.random() * 1500));
 
   const searchUrl = `https://www.${domain}/s?k=${encodeURIComponent(kw)}`;
 
@@ -701,7 +701,15 @@ async function _getWorkerContext(w, domain) {
       // so the CSS-degrade guard can re-read a page with a different block list.
       // Warm the jar on the homepage before any /dp/ hit — see the 202 note above.
       const warm = await w.ctx.newPage();
+      // v7.1.54: the warm-up used to run with NO route handler, so this one page
+      // pulled the full homepage — every image, font and stylesheet — while every
+      // /dp/ read next to it was carefully blocking them. It is also the page that
+      // runs on every relaunch, and relaunches just became common now that the
+      // empty-document block classifier actually trips the rest/relaunch path.
+      await warm.route('**/*', route =>
+        BRAND_BLOCK_WARM.includes(route.request().resourceType()) ? route.abort() : route.continue());
       await warm.goto(`https://www.${domain}/`, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(() => {});
+      await _dismissInterstitial(warm);
       await warm.waitForTimeout(2000);
       await warm.close().catch(() => {});
       console.log(`🏷️  Brand browser #${w.id} ready — real Chrome, profile ${_profileDir(w.id)}`);
@@ -780,6 +788,40 @@ function _isBlockedInPage() {
 // only ~8% more and risks both JS-rendered bylines and looking non-human.
 const BRAND_BLOCK_FAST  = ['image', 'media', 'font', 'stylesheet'];
 const BRAND_BLOCK_LIGHT = ['image', 'media'];
+// Warm-up keeps stylesheets (it is one page per launch, and a homepage that
+// renders normally is the point of warming) but never needs images or media.
+const BRAND_BLOCK_WARM  = ['image', 'media', 'font'];
+
+// Amazon's "Continue shopping" interstitial carries no #productTitle, no
+// #centerCol and no title — it reads as {brand:"", title:"", markers:false},
+// which is precisely the empty-document shape that was arriving at 2 of every 3
+// reads. The extension has always clicked through this ("⚡ Continue Shopping
+// clicked" in the panel log); the Playwright reader never did, so it scored the
+// interstitial as a failed product page and handed the item back to the
+// extension, which then paid a real Amazon tab to do what this click does.
+// Selector list ported from kamran_brand_architect_v5.py's
+// _dismiss_amazon_interstitial, which has been carrying this in production.
+const _INTERSTITIAL_SELECTORS = [
+  "input[value='Continue shopping']", "input[value='Continue Shopping']",
+  "button:has-text('Continue shopping')", "button:has-text('Continue Shopping')",
+  "a:has-text('Continue shopping')", "a:has-text('Continue Shopping')",
+  '#continue-shopping', ".a-button-input[value*='Continue']",
+  "[data-action='continue-shopping']", "input[name='continue-shopping']",
+];
+async function _dismissInterstitial(page) {
+  for (const sel of _INTERSTITIAL_SELECTORS) {
+    try {
+      const el = await page.$(sel);
+      if (el && await el.isVisible()) {
+        await el.click({ timeout: 3000 });
+        // The click triggers a navigation to the page we actually wanted.
+        await page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => {});
+        return true;
+      }
+    } catch (_) { /* selector unsupported or element detached — try the next */ }
+  }
+  return false;
+}
 
 async function _readPage(ctx, url, blockList) {
   const page = await ctx.newPage();
@@ -787,6 +829,10 @@ async function _readPage(ctx, url, blockList) {
     await page.route('**/*', route =>
       blockList.includes(route.request().resourceType()) ? route.abort() : route.continue());
     const resp = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: BRAND_GOTO_MS });
+    // Click through "Continue shopping" BEFORE waiting for product selectors —
+    // otherwise both waits burn their full timeout on an interstitial that was
+    // never going to contain them, and the read returns empty.
+    await _dismissInterstitial(page);
     await page.waitForSelector('#bylineInfo', { timeout: 6000 })
       .catch(() => page.waitForSelector('#productTitle, #centerCol, #ppd', { timeout: 4000 }).catch(() => {}));
     const status  = resp ? resp.status() : 0;
@@ -805,6 +851,28 @@ async function _attemptRead(w, url, domain) {
   try {
     const ctx = await _getWorkerContext(w, domain);
     let { status, blocked, out } = await _readPage(ctx, url, BRAND_BLOCK_FAST);
+
+    // v7.1.54: a page with NO product markers at all is a wall, whatever the
+    // status line says. Measured live: /dp/ reads were coming back
+    // {blocked:false, brand:"", title:"", hasProductMarkers:false} at 2 out of
+    // every 3 reads — an empty document scored as "product page, no byline".
+    // Two things broke because of that misclassification, and they compounded:
+    //   * Server: _brandStats.blocked stayed 0, so w.strikes never incremented,
+    //     so BRAND_BLOCK_STRIKES / BRAND_REST_MS never fired. The profile that
+    //     had gone hot was never rested or relaunched — it just kept reading
+    //     walls forever, which is why the empty rate climbed instead of healing.
+    //   * Extension: it received no brand AND no markers, which is exactly its
+    //     _fetchBlocked condition, so it paid a full real-Amazon tab recovery
+    //     for every one of them. That is the source of the bot-wall storm in
+    //     the panel — the local reader was quietly handing the work back.
+    // A real product page always carries at least one of the markers checked by
+    // _extractBrandInPage. Zero markers AND no title is not a brandless product,
+    // it is a page that never rendered. Keep the genuine case (markers present,
+    // byline missing) out of this — that one is handled by the CSS rescue below.
+    if (!blocked && (!out || (!out.hasProductMarkers && !out.title))) {
+      blocked = true;
+      console.log(`  🚫 #${w.id} blocked — empty document, HTTP ${status} (no product markers)`);
+    }
 
     // Amazon's silent bot block is an HTTP 202 with an EMPTY body — no CAPTCHA,
     // no "Sorry" text, nothing for the in-page detector to match. Classifying it
