@@ -1,0 +1,22 @@
+{
+  "manifest_version": 3,
+  "name": "SG VPN Controller",
+  "version": "1.1.0",
+  "description": "Auto IP-switching for Source Genius. Preferred: chrome.proxy (deterministic, no clicking). Fallback: drives Urban VPN via a native host. Connects on Amazon blocks, rotates when slow, disconnects when clean.",
+  "minimum_chrome_version": "116",
+  "permissions": [
+    "nativeMessaging",
+    "storage",
+    "alarms",
+    "proxy",
+    "webRequest",
+    "webRequestAuthProvider"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "options_page": "options.html",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqq/qSf7cLDukCdrbdbzZecD9LuKC0KavGHZhEd4D1Ls8C83U1ATA2RiM79ohXtCEGPMfYLtAswdVJ8+GaqNDSEo/DCHirooIT45QnFdz3m0En5IQylEOxHp45/P7jw6r616eIgMTcB1vPqaU+jzaQST4esksW9XzY7zFdv1ktTskryoL4DILjOIvVpD+6tCLQ9582tfF5qSBwLaByo4xjj7Yi+CpDmrxXjpxnTWFxgcIh+eX0jt6WhO2kauV9uqPw0VGDpot9HRbN7BeeCdaGP2OQyYyskkkkER+o9HncI727hECk/tTpTpkK0jzyRIYayS7BrAcepM44u43QCPBtQIDAQAB",
+  "externally_connectable": {
+    "ids": ["pdoipfcegfhhijdnlfglfbkcbhhholkk"]
+  }
+}

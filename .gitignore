@@ -1,0 +1,9 @@
+node_modules/
+*.log
+.env
+Scrapped/
+scrapped/
+# Extension signing key — keep OUT of version control (needed only to pack a .crx
+# later; the extension ID is already pinned via the manifest "key" field).
+sg-main-extension-private-key.pem
+*.pem
