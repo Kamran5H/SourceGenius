@@ -37,7 +37,8 @@ const assembled = [
   extractFunction(src, 'validateResult'),
   'const RUNTIME_SNAPSHOT_MAX_AGE_MS = 600000;',
   extractFunction(src, '_runtimeSnapshotIsFresh'),
-  'module.exports = { _parseAmazonHtml, pickSearchCandidate, brandDomainResemblance, domainMatchesBrand, validateResult, _runtimeSnapshotIsFresh, sgBrandFromTitleSlug };',
+  extractFunction(src, 'buildCsv'),
+  'module.exports = { _parseAmazonHtml, pickSearchCandidate, brandDomainResemblance, domainMatchesBrand, validateResult, _runtimeSnapshotIsFresh, sgBrandFromTitleSlug, buildCsv };',
 ].join('\n\n');
 
 const {
@@ -48,6 +49,7 @@ const {
   validateResult,
   _runtimeSnapshotIsFresh,
   sgBrandFromTitleSlug,
+  buildCsv,
 } = compileModule(assembled, BG_PATH);
 
 // ── sgBrandFromTitleSlug (v7.1.53) ──────────────────────────────────────────
@@ -167,6 +169,19 @@ test('domainMatchesBrand: unrelated domain does not match', () => {
   assert.equal(domainMatchesBrand('https://www.totallydifferent.com', 'Nike'), false);
 });
 
+test('domainMatchesBrand: rejects 4-char prefix false positives (e.g. Apple vs application.com)', () => {
+  assert.equal(domainMatchesBrand('https://application.com', 'Apple'), false);
+  assert.equal(domainMatchesBrand('https://startups.com', 'Starbucks'), false);
+  assert.equal(domainMatchesBrand('https://apple.com', 'Apple'), true);
+  assert.equal(domainMatchesBrand('https://starbucks.com', 'Starbucks'), true);
+});
+
+test('domainMatchesBrand: multi-word brand anchor matching without stopword leakage', () => {
+  assert.equal(domainMatchesBrand('https://anker.com', 'Anker Innovations'), true);
+  assert.equal(domainMatchesBrand('https://innovations.com', 'Anker Innovations'), false);
+  assert.equal(domainMatchesBrand('https://globalnews.ca', 'Global Tools'), false);
+});
+
 test('domainMatchesBrand: invalid URL is handled without throwing', () => {
   assert.equal(domainMatchesBrand('not a url', 'Nike'), false);
 });
@@ -237,6 +252,48 @@ test('_parseAmazonHtml: no brand markers yields an empty brand and hasProductMar
   const result = _parseAmazonHtml(html, 'https://www.amazon.com/dp/B0C1D2E3F4');
   assert.equal(result.brand, '');
   assert.equal(result.hasProductMarkers, false);
+});
+
+test('_parseAmazonHtml: extracts productImage and brandLogo from HTML', () => {
+  const html = `
+    <html><body>
+      <div id="dp">
+        <div id="bylineInfo_feature_div"><img src="https://m.media-amazon.com/images/S/stores-image-avatar/logo123.png" /></div>
+        <span id="productTitle">Anker Power Bank 24000mAh</span>
+        <img id="landingImage" src="https://m.media-amazon.com/images/I/71xyz123.jpg" />
+        <script type="application/ld+json">{"brand":{"name":"Anker"}}</script>
+      </div>
+    </body></html>
+  `;
+  const result = _parseAmazonHtml(html, 'https://www.amazon.com/dp/B0C1D2E3F4');
+  assert.equal(result.brand, 'Anker');
+  assert.equal(result.asin, 'B0C1D2E3F4');
+  assert.equal(result.title, 'Anker Power Bank 24000mAh');
+  assert.equal(result.productImage, 'https://m.media-amazon.com/images/I/71xyz123.jpg');
+  assert.equal(result.brandLogo, 'https://m.media-amazon.com/images/S/stores-image-avatar/logo123.png');
+  assert.equal(result.hasProductMarkers, true);
+});
+
+// ── buildCsv ────────────────────────────────────────────────────────────
+test('buildCsv: formats CSV with logo, product, and verification columns', () => {
+  const results = [
+    {
+      url: 'https://www.amazon.com/dp/B0C1D2E3F4',
+      brand: 'Anker',
+      website: 'https://anker.com',
+      brandLogo: 'https://m.media-amazon.com/images/S/stores-image-avatar/logo123.png',
+      title: 'Anker 737 Power Bank',
+      productImage: 'https://m.media-amazon.com/images/I/71xyz123.jpg',
+      logoMatched: true,
+      productMatched: true,
+      status: 'found'
+    }
+  ];
+  const profile = { name: 'Tester', email: 'test@example.com' };
+  const csv = buildCsv(results, profile);
+  assert.match(csv, /# Exported by: Tester <test@example.com>/);
+  assert.match(csv, /"Amazon URL","Brand Name","Official Website","Brand Logo","Product Title","Product Image","Logo Verified","Product Verified"/);
+  assert.match(csv, /"https:\/\/www\.amazon\.com\/dp\/B0C1D2E3F4","Anker","https:\/\/anker\.com","https:\/\/m\.media-amazon\.com\/images\/S\/stores-image-avatar\/logo123\.png","Anker 737 Power Bank","https:\/\/m\.media-amazon\.com\/images\/I\/71xyz123\.jpg","Yes","Yes"/);
 });
 
 // ── validateResult ──────────────────────────────────────────────────────

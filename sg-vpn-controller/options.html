@@ -18,12 +18,9 @@
 </head>
 <body>
   <h1>SG VPN Controller</h1>
-  <p class="hint">Auto-switches IP while Source Genius runs. Recommended backend is <b>Proxy</b> — deterministic, no clicking, no calibration.</p>
+  <p class="hint">Auto-switches proxy IP while Source Genius runs via deterministic <code>chrome.proxy</code> PAC routing.</p>
 
-  <h2>Backend</h2>
-  <label><input type="radio" name="backend" value="proxy" checked> <b>Proxy</b> (chrome.proxy — reliable, needs proxy endpoints below)</label>
-  <label><input type="radio" name="backend" value="urbanvpn"> <b>Urban VPN</b> (native-host clicker — fragile, needs calibration; see README)</label>
-  <label><input type="checkbox" id="enabled" checked> Controller enabled</label>
+  <label><input type="checkbox" id="enabled" checked> <b>Controller enabled</b> (auto-rotates proxies on Amazon rate limit/block)</label>
 
   <h2>Proxies <span class="hint">(one per line, top = first used; rotates down the list on block/slow)</span></h2>
   <textarea id="proxies" placeholder="http://user:pass@gate.smartproxy.com:7000&#10;http://user:pass@1.2.3.4:8080&#10;socks5://5.6.7.8:1080"></textarea>

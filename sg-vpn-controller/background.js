@@ -21,7 +21,6 @@
 // Configure via the options page (right-click extension → Options), or by
 // setting chrome.storage.local: sgBackend, sgProxies, sgProxyEnabled.
 
-const HOST                = 'com.sourcegenius.vpn';
 const CLEAN_DISCONNECT_MS = 90_000;
 const ROTATE_DEBOUNCE_MS  = 30_000;
 const DISCONNECT_ALARM    = 'sg-vpn-disconnect';
@@ -66,7 +65,7 @@ async function cfg() {
   const s = await chrome.storage.local.get(['sgBackend', 'sgProxies', 'sgProxyEnabled', 'sgProxyIdx', 'vpnOn', 'lastRotate']);
   return {
     backend:  s.sgBackend || 'proxy',
-    proxies:  (Array.isArray(s.sgProxies) && s.sgProxies.length) ? s.sgProxies : DEFAULT_PROXIES,
+    proxies:  (Array.isArray(s.sgProxies) && s.sgProxies.length) ? s.sgProxies : [],
     enabled:  s.sgProxyEnabled !== false,       // default enabled
     idx:      s.sgProxyIdx | 0,
     vpnOn:    !!s.vpnOn,
@@ -79,9 +78,8 @@ const save = patch => chrome.storage.local.set(patch);
 function proxyDirective(p) {
   const host = `${p.host}:${p.port}`;
   const scheme = (p.scheme || 'http').toLowerCase();
-  // "; DIRECT" fallback: if the proxy is unreachable (dead free proxy), Chrome
-  // uses a direct connection instead of hard-failing every Amazon request. Worst
-  // case the tool behaves like no-proxy (your real IP) rather than breaking.
+  // "; DIRECT" fallback: if the proxy is unreachable, Chrome
+  // uses a direct connection instead of hard-failing every Amazon request.
   if (scheme === 'socks5') return `SOCKS5 ${host}; DIRECT`;
   if (scheme === 'socks4' || scheme === 'socks') return `SOCKS ${host}; DIRECT`;
   if (scheme === 'https') return `HTTPS ${host}; DIRECT`;
@@ -98,7 +96,11 @@ function buildPac(p) {
 }
 async function applyProxy(i) {
   const c = await cfg();
-  if (!c.proxies.length) { console.warn('[vpn] no proxies configured'); return false; }
+  if (!c.proxies.length) {
+    console.warn('[vpn] no custom proxies configured — staying DIRECT (add proxies in extension Options)');
+    await clearProxy();
+    return false;
+  }
   const idx = ((i % c.proxies.length) + c.proxies.length) % c.proxies.length;
   const p = c.proxies[idx];
   await save({ sgProxyIdx: idx, _curProxy: p });
@@ -129,28 +131,13 @@ chrome.webRequest.onAuthRequired.addListener(
   ['asyncBlocking']
 );
 
-// ── native-host (Urban VPN clicker) backend ─────────────────────────────
-function callHost(action) {
-  return new Promise(resolve => {
-    let port;
-    try { port = chrome.runtime.connectNative(HOST); }
-    catch (e) { console.warn('[vpn] connectNative threw:', e?.message); return resolve(false); }
-    let done = false;
-    const finish = ok => { if (!done) { done = true; try { port.disconnect(); } catch (_) {} resolve(ok); } };
-    port.onMessage.addListener(m => { console.log('[vpn] host reply:', m); finish(!!(m && m.ok)); });
-    port.onDisconnect.addListener(() => { const e = chrome.runtime.lastError; if (e) console.warn('[vpn] host:', e.message); finish(false); });
-    try { port.postMessage({ action }); } catch (e) { console.warn('[vpn] postMessage:', e?.message); finish(false); }
-  });
-}
-
-// ── backend-agnostic actions ─────────────────────────────────────────────
+// ── proxy connection actions ─────────────────────────────────────────────
 async function connect() {
   const c = await cfg();
   if (c.vpnOn) return;
   await save({ vpnOn: true });
   console.log('[vpn] connect');
-  if (c.backend === 'urbanvpn') await callHost('connect');
-  else await applyProxy(c.idx);
+  await applyProxy(c.idx);
 }
 async function disconnect() {
   await chrome.alarms.clear(DISCONNECT_ALARM);
@@ -158,8 +145,7 @@ async function disconnect() {
   if (!c.vpnOn) return;
   await save({ vpnOn: false });
   console.log('[vpn] disconnect');
-  if (c.backend === 'urbanvpn') await callHost('disconnect');
-  else await clearProxy();
+  await clearProxy();
 }
 async function rotate() {
   const c = await cfg();
@@ -167,8 +153,7 @@ async function rotate() {
   await save({ lastRotate: Date.now() });
   if (!c.vpnOn) { await connect(); return; }
   console.log('[vpn] rotate');
-  if (c.backend === 'urbanvpn') await callHost('rotate');
-  else await applyProxy(c.idx + 1);
+  await applyProxy(c.idx + 1);
 }
 async function armDisconnect() {
   const c = await cfg();

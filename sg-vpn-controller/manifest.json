@@ -2,10 +2,9 @@
   "manifest_version": 3,
   "name": "SG VPN Controller",
   "version": "1.1.0",
-  "description": "Auto IP-switching for Source Genius. Preferred: chrome.proxy (deterministic, no clicking). Fallback: drives Urban VPN via a native host. Connects on Amazon blocks, rotates when slow, disconnects when clean.",
+  "description": "Auto IP-switching for Source Genius via chrome.proxy PAC routing. Connects on Amazon blocks, rotates when slow, disconnects when clean.",
   "minimum_chrome_version": "116",
   "permissions": [
-    "nativeMessaging",
     "storage",
     "alarms",
     "proxy",

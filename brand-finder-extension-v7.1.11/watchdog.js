@@ -16,6 +16,12 @@
 (function () {
   'use strict';
 
+  // Only monitor service worker responsiveness from target scraping tabs
+  // (Amazon marketplaces and supported search engines), avoiding background ping storms.
+  const host = (location.hostname || '').toLowerCase();
+  const isTargetDomain = /amazon\.|google\.|bing\.|duckduckgo\.|ecosia\.|yahoo\.|brave\.|mojeek\./i.test(host);
+  if (!isTargetDomain) return;
+
   const PING_INTERVAL_MS  = 15000;  // ping every 15 seconds
   const MAX_FAILURES      = 3;      // escalate after 3 consecutive failures (~45s)
   const RELOAD_COOLDOWN   = 60000;  // this tab won't re-request a reload more than once/min

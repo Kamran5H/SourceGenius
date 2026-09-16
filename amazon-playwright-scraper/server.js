@@ -41,9 +41,10 @@ const app = express();
 //      on the LAN can reach it either — loopback only.
 app.use(cors({
   origin(origin, cb) {
-    // No Origin header = same-machine tooling (curl, the test script) → allow.
+    // No Origin header = same-machine tooling (curl, node scripts, extension SW)
     if (!origin) return cb(null, true);
     if (/^chrome-extension:\/\//i.test(origin)) return cb(null, true);
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return cb(null, true);
     return cb(new Error('Origin not allowed'), false);
   },
 }));
@@ -754,7 +755,40 @@ function _extractBrandInPage() {
   const title = (titleEl ? titleEl.textContent : '').trim();
   const asin = ((location.href.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase();
   const hasProductMarkers = !!document.querySelector('#productTitle, #centerCol, #ppd, #dp, #detailBullets_feature_div');
-  return { brand, asin, title, hasProductMarkers };
+
+  let productImage = '';
+  const landImg = document.querySelector('#landingImage, #imgBlkFront, #main-image');
+  if (landImg) {
+    productImage = landImg.getAttribute('data-old-hires') || landImg.getAttribute('src') || '';
+    if (!productImage && landImg.getAttribute('data-a-dynamic-image')) {
+      try {
+        const dyn = JSON.parse(landImg.getAttribute('data-a-dynamic-image'));
+        const keys = Object.keys(dyn);
+        if (keys.length) productImage = keys[0];
+      } catch (_) {}
+    }
+  }
+  if (!productImage) {
+    const metaImg = document.querySelector('meta[property="og:image"]');
+    if (metaImg) productImage = metaImg.getAttribute('content') || '';
+  }
+
+  let brandLogo = '';
+  const logoEl = document.querySelector('#storefront-logo img, #brandStoreLogo img, .brand-logo img, #bylineInfo_feature_div img, #brand-snapshot img, #brand-story-header img');
+  if (logoEl) brandLogo = logoEl.getAttribute('src') || '';
+  if (!brandLogo) {
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+      if (brandLogo) return;
+      try {
+        const j = JSON.parse(s.textContent);
+        const l = (j.brand && (j.brand.logo || j.brand.image)) || (j.publisher && j.publisher.logo) || j.logo;
+        if (typeof l === 'string') brandLogo = l;
+        else if (l && typeof l.url === 'string') brandLogo = l.url;
+      } catch (_) {}
+    });
+  }
+
+  return { brand, asin, title, productImage, brandLogo, hasProductMarkers };
 }
 
 function _isBlockedInPage() {

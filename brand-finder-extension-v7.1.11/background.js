@@ -176,7 +176,7 @@ async function sgComputeBuildHash() {
 
   // Fallback to approved signing key if hash could not be computed
   const devKey = String.fromCharCode(97, 56, 97, 51, 97, 51, 57, 99, 100, 49, 99, 55, 102, 102, 53, 55, 100, 53, 57, 50, 56, 101, 50, 55, 56, 97, 102, 102, 56, 57, 99, 102, 56, 51, 51, 56, 98, 53, 97, 56, 57, 97, 55, 51, 55, 99, 100, 57, 101, 54, 102, 54, 49, 54, 102, 51, 49, 50, 50, 98, 101, 101, 53, 97);
-  if (!_sgBuildHash || _sgBuildHash !== devKey) {
+  if (!_sgBuildHash) {
     _sgBuildHash = devKey;
   }
   return _sgBuildHash;
@@ -1888,8 +1888,38 @@ function _parseAmazonHtml(html, url) {
   const titleM = html.match(/id="productTitle"[^>]*>\s*([^<]+?)\s*</i);
   const title  = titleM ? decode(titleM[1]).trim() : '';
 
+  // Extract Product Image URL
+  let productImage = '';
+  const hiResM = html.match(/"hiRes"\s*:\s*"([^"]+)"/i) || html.match(/"large"\s*:\s*"([^"]+)"/i);
+  if (hiResM && hiResM[1] && /^https?:\/\//i.test(hiResM[1])) {
+    productImage = hiResM[1];
+  } else {
+    const landingImgM = html.match(/id="landingImage"[^>]+src="([^"]+)"/i) ||
+                        html.match(/id="imgBlkFront"[^>]+src="([^"]+)"/i) ||
+                        html.match(/id="main-image"[^>]+src="([^"]+)"/i);
+    if (landingImgM && landingImgM[1] && /^https?:\/\//i.test(landingImgM[1])) {
+      productImage = landingImgM[1];
+    } else {
+      const dynImgM = html.match(/data-a-dynamic-image="\{&quot;(https?:[^&"]+)&quot;/i);
+      if (dynImgM && dynImgM[1]) productImage = dynImgM[1];
+    }
+  }
+
+  // Extract Brand Logo URL
+  let brandLogo = '';
+  const storeLogoM = html.match(/id="(?:brandStoreLogo|storefront-logo|bylineInfo_feature_div)"[^>]*>[\s\S]{0,500}?<img[^>]+src="([^"]+)"/i) ||
+                     html.match(/class="[^"]*(?:brand-logo|brand-snapshot)[^"]*"[^>]*>[\s\S]{0,500}?<img[^>]+src="([^"]+)"/i);
+  if (storeLogoM && storeLogoM[1] && /^https?:\/\//i.test(storeLogoM[1])) {
+    brandLogo = storeLogoM[1];
+  } else {
+    const jsonLogoM = html.match(/"logo"\s*:\s*"([^"]+)"/i) || html.match(/"brand"\s*:\s*\{[^}]*?"logo"\s*:\s*"([^"]+)"/i);
+    if (jsonLogoM && jsonLogoM[1] && /^https?:\/\//i.test(jsonLogoM[1])) {
+      brandLogo = jsonLogoM[1];
+    }
+  }
+
   const hasProductMarkers = /id="productTitle"|id="centerCol"|id="ppd"|id="dp"|detailBullets_feature_div|productDetails_techSpec/i.test(html);
-  return { brand, asin, title, hasProductMarkers, hasCaptcha: false };
+  return { brand, asin, title, productImage, brandLogo, hasProductMarkers, hasCaptcha: false };
 }
 
 
@@ -1952,7 +1982,7 @@ async function fetchAmazonProduct(url, tabTimeout) {
   if (ST.running || ST.scrapeProgress.active) setSgGuardCookie(true); // v7.1.39: keep cleaner paused (45s-throttled)
   const timeout = Math.min(Math.max(Number(tabTimeout) || 15000, 8000), 20000);
   const maxAttempts = 3;
-  const empty = { brand: '', asin: ((url.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase(), title: '', hasProductMarkers: false, hasCaptcha: false };
+  const empty = { brand: '', asin: ((url.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase(), title: '', productImage: '', brandLogo: '', hasProductMarkers: false, hasCaptcha: false };
 
   await _acquireAmazonFetchSlot();
   try {
@@ -2045,7 +2075,7 @@ async function fetchAmazonProduct(url, tabTimeout) {
 async function fetchAmazonProductViaTab(url, timeout) {
   let tid = null;
   const asinFromUrl = ((url.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase();
-  const empty = { brand: '', asin: asinFromUrl, title: '', hasProductMarkers: false, hasCaptcha: false };
+  const empty = { brand: '', asin: asinFromUrl, title: '', productImage: '', brandLogo: '', hasProductMarkers: false, hasCaptcha: false };
   try {
     const cap = Math.min(Math.max(Number(timeout) || 20000, 15000), 30000);
     tid = await openAmazonScrapeTab(url, cap, 1);            // throws if it can't clear the wall
@@ -2110,7 +2140,40 @@ async function fetchAmazonProductViaTab(url, timeout) {
         const title = (document.querySelector('#productTitle')?.textContent || '').trim();
         const asin = ((location.href.match(/\/(?:dp|gp\/product|product)\/([A-Z0-9]{10})/i) || [])[1] || '').toUpperCase();
         const hasProductMarkers = !!document.querySelector('#productTitle, #centerCol, #ppd, #dp, #detailBullets_feature_div');
-        return { brand, asin, title, hasProductMarkers, hasCaptcha: false };
+
+        let productImage = '';
+        const landImg = document.querySelector('#landingImage, #imgBlkFront, #main-image');
+        if (landImg) {
+          productImage = landImg.getAttribute('data-old-hires') || landImg.getAttribute('src') || '';
+          if (!productImage && landImg.getAttribute('data-a-dynamic-image')) {
+            try {
+              const dyn = JSON.parse(landImg.getAttribute('data-a-dynamic-image'));
+              const keys = Object.keys(dyn);
+              if (keys.length) productImage = keys[0];
+            } catch (_) {}
+          }
+        }
+        if (!productImage) {
+          const metaImg = document.querySelector('meta[property="og:image"]');
+          if (metaImg) productImage = metaImg.getAttribute('content') || '';
+        }
+
+        let brandLogo = '';
+        const logoEl = document.querySelector('#storefront-logo img, #brandStoreLogo img, .brand-logo img, #bylineInfo_feature_div img, #brand-snapshot img, #brand-story-header img');
+        if (logoEl) brandLogo = logoEl.getAttribute('src') || '';
+        if (!brandLogo) {
+          document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+            if (brandLogo) return;
+            try {
+              const j = JSON.parse(s.textContent);
+              const l = (j.brand && (j.brand.logo || j.brand.image)) || (j.publisher && j.publisher.logo) || j.logo;
+              if (typeof l === 'string') brandLogo = l;
+              else if (l && typeof l.url === 'string') brandLogo = l.url;
+            } catch (_) {}
+          });
+        }
+
+        return { brand, asin, title, productImage, brandLogo, hasProductMarkers, hasCaptcha: false };
       },
     }).catch(() => [{ result: null }]);
 
@@ -3193,11 +3256,13 @@ async function fetchAmazonProductViaServer(url) {
     _brandServerLastOk = Date.now();
     _brandServerUp = true;
     // Resting or walled: report a block so the caller's own wall accounting runs.
-    if (d.blocked) return { brand: '', asin: '', title: '', hasProductMarkers: false, hasCaptcha: false, blocked: true };
+    if (d.blocked) return { brand: '', asin: '', title: '', productImage: '', brandLogo: '', hasProductMarkers: false, hasCaptcha: false, blocked: true };
     return {
       brand: d.brand || '',
       asin:  d.asin  || '',
       title: d.title || '',
+      productImage: d.productImage || '',
+      brandLogo: d.brandLogo || '',
       hasProductMarkers: !!d.hasProductMarkers,
       hasCaptcha: false,
     };
@@ -3211,7 +3276,7 @@ async function fetchAmazonProductViaServer(url) {
 // CORE ITEM PIPELINE  (v2.0 — unchanged)
 // ═══════════════════════════════════════════════════════════════
 async function processItem(item, mcfg) {
-  const res = { ...item, brand:'', title:'', website:'', method:'', conf:0, status:'pending', notes:'' };
+  const res = { ...item, brand:'', title:'', website:'', method:'', conf:0, status:'pending', notes:'', productImage:'', brandLogo:'', logoMatched:false, productMatched:false };
   let tid = null;
   let fetchResult = null; // hoisted so the tab-recovery fallback below can read it
 
@@ -3283,6 +3348,8 @@ async function processItem(item, mcfg) {
       res.brand = fetchResult.brand || item.brandHint || '';
       res.title = fetchResult.title || '';
       if (!res.asin && fetchResult.asin) res.asin = fetchResult.asin; // page-scanned ASIN fallback
+      if (fetchResult.productImage) res.productImage = fetchResult.productImage;
+      if (fetchResult.brandLogo) res.brandLogo = fetchResult.brandLogo;
       if (res.brand) addLog(`  🏷️  Brand: "${res.brand}"${!fetchResult.brand && item.brandHint ? ' (from keyword hint)' : ''}`);
       else            addLog('  ⚠️  Brand not found on Amazon page');
     } else {
@@ -3317,6 +3384,8 @@ async function processItem(item, mcfg) {
           res.brand = viaTab.brand;
           res.title = res.title || viaTab.title || '';
           if (!res.asin && viaTab.asin) res.asin = viaTab.asin;
+          if (viaTab.productImage) res.productImage = viaTab.productImage;
+          if (viaTab.brandLogo) res.brandLogo = viaTab.brandLogo;
           addLog(`  🏷️  Brand (tab recovery attempt ${attempt}): "${res.brand}"`);
           break;
         } else if (_sawProductPage) {
@@ -3564,15 +3633,9 @@ async function processItem(item, mcfg) {
   }
   if (res.website && mcfg.verify && !_preVerified) {
     addLog(`  🔎  Verifying ${res.website}…`);
-    // v7.1.38 fast path: tabless HTML verify first (~1-2s). A clear positive
-    // skips the 5-8s tab entirely; a parked page is discarded immediately.
-    // Anything inconclusive (SPA shell, fetch blocked, weak miss) falls through
-    // to the original tab-based verifyBrandSite — never discarded on fetch alone.
+    // Fast path: tabless parked-domain check first (~1-2s). A parked page is discarded immediately.
     const fastV = await quickBrandCheckViaFetch(res.website, res.brand, Math.min(Number(mcfg.tabTimeout) || 9000, 9000));
-    if (fastV.ok) {
-      res.conf = Math.min(99, res.conf + Math.max(5, fastV.bonus));
-      addLog(`  ✅ Verified via fetch (conf ${res.conf}%)`);
-    } else if (fastV.parked) {
+    if (fastV.parked) {
       addLog(`  ❌ Verification failed — parked / for-sale domain — discarding`);
       res.website = '';
       res.method  = '';
@@ -3581,15 +3644,27 @@ async function processItem(item, mcfg) {
       try {
         const fetchRes = await resilientFetch(res.website, mcfg.tabTimeout, 'verify');
         tid = fetchRes.tabId;
-        const v = await verifyBrandSite(tid, res.brand, res.asin);
+        const v = await verifyBrandSite(tid, res.brand, res.asin, res.title, res.brandLogo, res.productImage);
         if (v.failed) {
           addLog(`  ❌ Verification failed (score ${v.score}) — discarding`);
           res.website = '';
           res.method  = '';
           res.conf    = 0;
         } else {
-          res.conf = Math.min(99, res.conf + v.bonus);
-          addLog(`  ✅ Verified (conf ${res.conf}%)`);
+          res.logoMatched = !!v.logoMatched;
+          res.productMatched = !!v.productMatched;
+          if (v.logoUrl && !res.brandLogo) res.brandLogo = v.logoUrl;
+
+          if (v.logoMatched && v.productMatched) {
+            res.conf = 100;
+            addLog(`  🎯 100% Verified Official Site: Brand Logo & Product matched on ${res.website}`);
+          } else if (v.logoMatched) {
+            res.conf = Math.min(99, Math.max(88, res.conf + v.bonus));
+            addLog(`  ✅ Verified Official Site: Brand Logo matched on ${res.website} (${res.conf}%)`);
+          } else {
+            res.conf = Math.min(99, res.conf + v.bonus);
+            addLog(`  ✅ Verified (conf ${res.conf}%)`);
+          }
         }
       } catch(e) {
         addLog(`  ⚠️  Verify: ${e.message}`);
@@ -3678,35 +3753,157 @@ async function scrapeGoogleResults(tabId) {
   return result || [];
 }
 
-async function verifyBrandSite(tabId, brand, asin) {
+async function verifyBrandSite(tabId, brand, asin, productTitle, brandLogo, productImage) {
   const [{ result }] = await chrome.scripting.executeScript({
     target: { tabId },
-    func: (bn, asinStr) => {
-      const text  = (document.body?.innerText||'').toLowerCase().slice(0,50000);
-      const html  = (document.documentElement?.innerHTML||'').toLowerCase().slice(0,100000);
-      const title = document.title.toLowerCase();
-      const b     = bn.toLowerCase();
+    func: (bn, asinStr, pTitle, bLogo, pImg) => {
+      const text  = (document.body?.innerText || '').toLowerCase().slice(0, 50000);
+      const html  = (document.documentElement?.innerHTML || '').toLowerCase().slice(0, 100000);
+      const title = (document.title || '').toLowerCase();
+      const b     = (bn || '').toLowerCase().trim();
+      const bTokens = b.split(/\s+/).filter(w => w.length >= 2);
 
       let score = 0;
-      if (title.includes(b))  score += 30;
+      let logoMatched = false;
+      let productMatched = false;
+      let detectedLogoUrl = '';
+
+      // ── Anti-parked domain detection ──────────────────────────────
+      const parkSignals = /parked|this domain|buy this domain|domain for sale|domain is for sale|sedoparking|hugedomains|dan\.com|afternic|sav\.com|undeveloped\.com|squadhelp\.com|brandbucket\.com/i;
+      if (parkSignals.test(text) || parkSignals.test(title)) {
+        return { score: -100, failed: true, bonus: 0, logoMatched: false, productMatched: false, logoUrl: '' };
+      }
+
+      // ── Third-party marketplace rejection ────────────────────────
+      const host = (location.hostname || '').toLowerCase();
+      if (/amazon\.|ebay\.|walmart\.|etsy\.|aliexpress\.|temu\.|target\.com/i.test(host)) {
+        return { score: -100, failed: true, bonus: 0, logoMatched: false, productMatched: false, logoUrl: '' };
+      }
+
+      // ── Basic Identity Signals ───────────────────────────────────
+      if (title.includes(b)) score += 30;
       const h1 = document.querySelector('h1');
       if (h1?.textContent.toLowerCase().includes(b)) score += 20;
-      if (text.includes(b))   score += 15;
-      if (html.includes('amazon.com')) score += 10;
+      if (text.includes(b)) score += 15;
       if (asinStr && html.includes(asinStr.toLowerCase())) score += 30;
-      if (/shop|product|buy|cart|store|order|checkout/i.test(text))  score += 10;
-      if (/our brand|about us|our story|official|founded/i.test(text)) score += 8;
-      if (/parked domain|buy this domain|domain for sale|sedoparking/i.test(text)) score -= 50;
+      if (/shop|product|buy|cart|store|order|checkout|catalog/i.test(text)) score += 10;
+      if (/our brand|about us|our story|official|founded|who we are/i.test(text)) score += 8;
       if (/authorized (dealer|reseller)/i.test(text)) score -= 15;
-      if (/ebay|walmart|etsy|aliexpress|amazon\.com/i.test(text.slice(0, 5000))) score -= 20;
-      // Small penalty for sparse pages — many legit brand landing pages are minimal
-      if (text.length < 80) score -= 10;
+      if (text.length < 80 && !title) score -= 10;
 
-      return { score, failed:score < 0, bonus:Math.max(0,Math.min(20,Math.floor((score-30)/5))) };
+      // ── Stage 1: Brand Logo Verification ─────────────────────────
+      // Look for logo elements in header/nav and document
+      const logoCandidates = Array.from(document.querySelectorAll(
+        'header img, nav img, [class*="header"] img, [class*="nav"] img, [id*="header"] img, [id*="nav"] img, ' +
+        '[class*="logo"] img, [id*="logo"] img, img[class*="logo"], img[id*="logo"], img[alt*="logo" i], ' +
+        'a[class*="logo"] img, a[id*="logo"] img, a[aria-label*="logo" i] img, ' +
+        'header svg, nav svg, [class*="logo"] svg, [id*="logo"] svg'
+      ));
+
+      for (const el of logoCandidates) {
+        const alt = (el.getAttribute('alt') || '').toLowerCase();
+        const ariaLabel = (el.getAttribute('aria-label') || '').toLowerCase();
+        const elTitle = (el.getAttribute('title') || '').toLowerCase();
+        const src = (el.getAttribute('src') || '').toLowerCase();
+        const href = (el.closest('a')?.getAttribute('href') || '').toLowerCase();
+        const ariaDesc = (el.getAttribute('aria-description') || '').toLowerCase();
+        const combined = `${alt} ${ariaLabel} ${elTitle} ${src} ${href} ${ariaDesc}`;
+
+        const matchesBrand = b && (combined.includes(b) || (bTokens.length > 0 && bTokens.every(t => combined.includes(t))));
+        if (matchesBrand) {
+          logoMatched = true;
+          score += 35;
+          if (el.src && /^https?:\/\//i.test(el.src)) detectedLogoUrl = el.src;
+          break;
+        }
+      }
+
+      // Check Schema.org / OpenGraph / Favicon for Brand Logo if not yet matched
+      if (!logoMatched) {
+        document.querySelectorAll('script[type="application/ld+json"]').forEach(s => {
+          if (logoMatched) return;
+          try {
+            const j = JSON.parse(s.textContent);
+            const org = (j['@type'] === 'Organization' || j['@type'] === 'Brand') ? j : (j.publisher || j.brand);
+            if (org) {
+              const name = String(org.name || '').toLowerCase();
+              if (name.includes(b) || (bTokens.length > 0 && bTokens.every(t => name.includes(t)))) {
+                const l = org.logo?.url || org.logo || org.image;
+                if (typeof l === 'string' && /^https?:\/\//i.test(l)) {
+                  logoMatched = true;
+                  detectedLogoUrl = l;
+                  score += 30;
+                }
+              }
+            }
+          } catch (_) {}
+        });
+      }
+
+      if (!detectedLogoUrl) {
+        const ogImg = document.querySelector('meta[property="og:image"]')?.getAttribute('content');
+        const icon = document.querySelector('link[rel="apple-touch-icon"], link[rel*="icon"]')?.getAttribute('href');
+        if (ogImg && /^https?:\/\//i.test(ogImg)) detectedLogoUrl = ogImg;
+        else if (icon && /^https?:\/\//i.test(icon)) detectedLogoUrl = icon;
+      }
+
+      // ── Stage 2: Product / Catalog Verification ──────────────────
+      if (pTitle && pTitle.length > 4) {
+        const modelMatches = pTitle.match(/\b[A-Z0-9]{2,}[-–][A-Z0-9]{2,}\b|\b[A-Z]{1,4}[0-9]{2,6}\b|\b[0-9]{3,5}\b/g) || [];
+        const cleanModels = modelMatches
+          .map(m => m.trim().toLowerCase())
+          .filter(m => !/^(1080p|4k|2023|2024|2025|2026|pack|set|piece|inch|inches|watt|volt|mah)$/i.test(m) && m.length >= 3);
+
+        const genericWords = new Set([
+          'for', 'with', 'and', 'the', 'portable', 'charger', 'black', 'white', 'pack', 'set',
+          'case', 'cover', 'strap', 'holder', 'cable', 'cord', 'adapter', 'wireless', 'bluetooth',
+          'usb', 'pro', 'max', 'plus', 'mini', 'ultra', 'new', 'upgraded', 'fast', 'heavy', 'duty',
+          'universal', 'premium', 'high', 'speed', 'compatible', 'replacement', 'pieces', 'piece'
+        ]);
+        const titleTokens = pTitle.toLowerCase().replace(/[^a-z0-9\s-]/g, ' ').split(/\s+/)
+          .filter(w => w.length >= 3 && !genericWords.has(w) && !bTokens.includes(w));
+
+        let foundModel = false;
+        for (const model of cleanModels) {
+          if (text.includes(model) || html.includes(model)) {
+            productMatched = true;
+            foundModel = true;
+            score += 35;
+            break;
+          }
+        }
+
+        if (!foundModel && titleTokens.length > 0) {
+          let matchedTokens = 0;
+          for (const token of titleTokens) {
+            if (text.includes(token)) matchedTokens++;
+          }
+          const ratio = matchedTokens / titleTokens.length;
+          if (matchedTokens >= 3 || (titleTokens.length >= 2 && ratio >= 0.5)) {
+            productMatched = true;
+            score += 25;
+          }
+        }
+      }
+
+      const hasCatalog = !!document.querySelector('.products, .product-grid, .shop-grid, #products, [class*="product-list"], [class*="collection-grid"]');
+      if (hasCatalog) score += 10;
+
+      const failed = score < 20;
+      const bonus = Math.max(0, Math.min(25, Math.floor((score - 20) / 4)));
+
+      return {
+        score,
+        failed,
+        bonus,
+        logoMatched,
+        productMatched,
+        logoUrl: detectedLogoUrl
+      };
     },
-    args: [brand, asin||''],
+    args: [brand, asin || '', productTitle || '', brandLogo || '', productImage || ''],
   });
-  return result || { score:0, bonus:0, failed:false };
+  return result || { score: 0, bonus: 0, failed: false, logoMatched: false, productMatched: false, logoUrl: '' };
 }
 
 async function detectCaptcha(tabId) {
@@ -4507,10 +4704,19 @@ function buildCsv(results, profile) {
     lines.push(`# Date: ${new Date().toISOString().slice(0,10)}`);
     lines.push('');
   }
-  const hdr  = ['Amazon URL','Brand Name','Official Website'];
+  const hdr  = ['Amazon URL', 'Brand Name', 'Official Website', 'Brand Logo', 'Product Title', 'Product Image', 'Logo Verified', 'Product Verified'];
   const rows = results
     .filter(r => r.status !== 'duplicate')
-    .map(r => [r.url||r.raw, r.brand, r.website]);
+    .map(r => [
+      r.url || r.raw,
+      r.brand,
+      r.website,
+      r.brandLogo || '',
+      r.title || r.productTitle || '',
+      r.productImage || '',
+      r.logoMatched ? 'Yes' : 'No',
+      r.productMatched ? 'Yes' : 'No',
+    ]);
   lines.push([hdr, ...rows].map(row => row.map(esc).join(',')).join('\n'));
   return lines.join('\n');
 }
@@ -4645,15 +4851,24 @@ function sgBrandFromTitleSlug(title, href) {
 function domainMatchesBrand(url, brand) {
   if (!url || !brand) return false;
   try {
-    const host    = new URL(url).hostname.toLowerCase().replace(/^(www\.|shop\.|store\.|my\.)/, '');
+    const host    = new URL(url).hostname.toLowerCase().replace(/^(www\.|shop\.|store\.|my\.|en\.|us\.|uk\.)/, '');
     const root    = host.split('.')[0].replace(/[^a-z0-9]/g,'');
     const bn      = brand.toLowerCase().replace(/[^a-z0-9]/g,'');
-    if (bn.length < 2) return root === bn;
-    if (root.includes(bn) || bn.includes(root))        return true;
-    const pfx = Math.min(bn.length, root.length, 5);
-    if (pfx >= 4 && bn.slice(0,pfx) === root.slice(0,pfx)) return true;
-    const words = brand.toLowerCase().split(/[\s\-_]+/).map(w=>w.replace(/[^a-z0-9]/g,'')).filter(w=>w.length>=5);
-    if (words.some(w => root.includes(w) || w.includes(root))) return true;
+    if (bn.length < 2 || root.length < 2) return root === bn;
+    if (root === bn) return true;
+    // Brand contained in domain root (e.g. "happybaby" in "happybabyfoods.com")
+    if (bn.length >= 3 && root.includes(bn)) return true;
+    const words = brand.toLowerCase().split(/[\s\-_]+/).map(w=>w.replace(/[^a-z0-9]/g,'')).filter(w=>w.length>=3);
+    if (words.length > 1) {
+      if (words.join('') === root) return true;
+      const STOPWORDS = new Set(['international','innovations','technologies','technology','enterprises','corporation','company','group','global','solutions','products','services','supplies','supply','industries','industry','official','store','brand','direct','online','shop']);
+      const anchorWords = words.filter(w => w.length >= 4 && !STOPWORDS.has(w));
+      if (anchorWords.some(w => root === w || (root.length >= w.length + 3 && root.includes(w) && (root.startsWith(w) || root.endsWith(w))))) {
+        return true;
+      }
+    } else if (words.length === 1 && bn.length >= 4) {
+      if (root.startsWith(bn) || root.endsWith(bn)) return true;
+    }
     return false;
   } catch(_) { return false; }
 }
@@ -4831,11 +5046,16 @@ async function pushToDatabase(res) {
   // Duplicate checks for brand (Step 2.5) and website (Step 4.5) were already
   // performed in processItem before this function is called — no third check needed.
   const r = await dbPost('addRecord', {
-    asinUrl:     res.url||res.raw||'',
+    asinUrl:         res.url || res.raw || '',
     brand,
     website,
-    memberName:  userProfile.name  || 'Unknown',
-    memberEmail: userProfile.email || '',
+    memberName:      userProfile.name  || 'Unknown',
+    memberEmail:     userProfile.email || '',
+    brandLogo:       res.brandLogo || '',
+    productImage:    res.productImage || '',
+    productTitle:    res.title || res.productTitle || '',
+    logoVerified:    !!res.logoMatched,
+    productVerified: !!res.productMatched,
   });
 
   // ── Log every outcome — success, duplicate, error, or null ───

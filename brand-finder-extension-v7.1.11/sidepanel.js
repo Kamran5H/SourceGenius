@@ -1249,11 +1249,15 @@ function renderResults(results) {
       : '<span style="color:var(--muted)">—</span>';
     const mt  = r.method ? `<span class="mt">${escHtml(r.method)}</span>` : '';
     const short = escHtml((r.url||r.raw||'').replace('https://www.amazon.com/','').slice(0,26)+'…');
-    const sb  = statusBadge(r.status);
+    const sb  = statusBadge(r.status, r);
     const rawUrl = escHtml(r.url||r.raw||'');
+    const logoImg = r.brandLogo ? `<img src="${escHtml(r.brandLogo)}" title="Brand Logo${r.logoMatched ? ' (Verified)' : ''}" style="width:22px;height:22px;object-fit:contain;border-radius:3px;background:#fff;border:1px solid ${r.logoMatched ? '#238636' : '#30363d'};" />` : '';
+    const prodImg = r.productImage ? `<img src="${escHtml(r.productImage)}" title="${escHtml(r.title||'Product')}${r.productMatched ? ' (Verified)' : ''}" style="width:22px;height:22px;object-fit:contain;border-radius:3px;background:#fff;border:1px solid ${r.productMatched ? '#238636' : '#30363d'};" />` : '';
+    const preview = (logoImg || prodImg) ? `<div style="display:inline-flex;gap:4px;align-items:center;">${logoImg}${prodImg}</div>` : '<span style="color:var(--muted)">—</span>';
     tr.innerHTML = `
       <td style="color:var(--muted);font-size:10px">${r.idx+1}</td>
       <td title="${escHtml(r.brand||'')}" style="font-weight:600">${r.brand ? escHtml(r.brand) : '<span style="color:var(--muted);font-weight:normal">—</span>'}</td>
+      <td>${preview}</td>
       <td><a href="${rawUrl}" class="sl" target="_blank" title="${rawUrl}">${short}</a></td>
       <td>${site}</td>
       <td>${conf}</td>
@@ -1290,11 +1294,15 @@ function appendResults(newItems, totalLen) {
       : '<span style="color:var(--muted)">—</span>';
     const mt  = r.method ? `<span class="mt">${escHtml(r.method)}</span>` : '';
     const short = escHtml((r.url||r.raw||'').replace('https://www.amazon.com/','').slice(0,26)+'…');
-    const sb  = statusBadge(r.status);
+    const sb  = statusBadge(r.status, r);
     const rawUrl = escHtml(r.url||r.raw||'');
+    const logoImg = r.brandLogo ? `<img src="${escHtml(r.brandLogo)}" title="Brand Logo${r.logoMatched ? ' (Verified)' : ''}" style="width:22px;height:22px;object-fit:contain;border-radius:3px;background:#fff;border:1px solid ${r.logoMatched ? '#238636' : '#30363d'};" />` : '';
+    const prodImg = r.productImage ? `<img src="${escHtml(r.productImage)}" title="${escHtml(r.title||'Product')}${r.productMatched ? ' (Verified)' : ''}" style="width:22px;height:22px;object-fit:contain;border-radius:3px;background:#fff;border:1px solid ${r.productMatched ? '#238636' : '#30363d'};" />` : '';
+    const preview = (logoImg || prodImg) ? `<div style="display:inline-flex;gap:4px;align-items:center;">${logoImg}${prodImg}</div>` : '<span style="color:var(--muted)">—</span>';
     tr.innerHTML = `
       <td style="color:var(--muted);font-size:10px">${r.idx+1}</td>
       <td title="${escHtml(r.brand||'')}" style="font-weight:600">${r.brand ? escHtml(r.brand) : '<span style="color:var(--muted);font-weight:normal">—</span>'}</td>
+      <td>${preview}</td>
       <td><a href="${rawUrl}" class="sl" target="_blank" title="${rawUrl}">${short}</a></td>
       <td>${site}</td>
       <td>${conf}</td>
@@ -1308,9 +1316,14 @@ function appendResults(newItems, totalLen) {
   $('rtitle').textContent = `Results (${renderedN})`;
 }
 
-function statusBadge(s) {
+function statusBadge(s, r) {
+  let foundLabel = '✅ Found';
+  if (r?.logoMatched && r?.productMatched) foundLabel = '🎯 100% Match';
+  else if (r?.logoMatched) foundLabel = '🛡️ Logo Match';
+  else if (r?.productMatched) foundLabel = '📦 Product Match';
+
   const m = {
-    found:['bf','✅ Found'], 'not-found':['bn','⏭ No site'],
+    found:['bf', foundLabel], 'not-found':['bn','⏭ No site'],
     error:['be','❌ Error'], skipped:['bk','⏩ Skip'],
     duplicate:['bd','🔁 Dupe'], 'db-duplicate':['bdb','🗄 DB Dupe'],
     'needs-review':['bnr','🔍 Review'],
@@ -1758,7 +1771,7 @@ async function sgComputeBuildHash() {
 
   // Fallback to offline developer signing key if production key is not resolved
   const devKey = String.fromCharCode(97, 56, 97, 51, 97, 51, 57, 99, 100, 49, 99, 55, 102, 102, 53, 55, 100, 53, 57, 50, 56, 101, 50, 55, 56, 97, 102, 102, 56, 57, 99, 102, 56, 51, 51, 56, 98, 53, 97, 56, 57, 97, 55, 51, 55, 99, 100, 57, 101, 54, 102, 54, 49, 54, 102, 51, 49, 50, 50, 98, 101, 101, 53, 97);
-  if (!_sgBuildHash || _sgBuildHash !== devKey) {
+  if (!_sgBuildHash) {
     _sgBuildHash = devKey;
   }
   return _sgBuildHash;

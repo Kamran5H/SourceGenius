@@ -1,4 +1,10 @@
 (function() {
+  // Source Genius stealth script: only apply browser spoofing on Amazon marketplaces
+  // and search engine domains so normal browsing (banking, tools, media) is untouched.
+  const host = (location.hostname || '').toLowerCase();
+  const isTargetDomain = /amazon\.|google\.|bing\.|duckduckgo\.|ecosia\.|yahoo\.|brave\.|mojeek\./i.test(host);
+  if (!isTargetDomain) return;
+
   const _s = Math.floor(Math.random() * 900) + 100;
   // Vary hardware to avoid a single detectable fingerprint
   const _hw = [2,4,6,8,12,16][Math.floor(Math.random()*6)];
@@ -170,14 +176,7 @@
     });
   }
 
-  // Timezone consistency (only override UTC to look organic)
-  try {
-    const origGetTimezoneOffset = Date.prototype.getTimezoneOffset;
-    Date.prototype.getTimezoneOffset = function() {
-      const real = origGetTimezoneOffset.call(this);
-      return real === 0 ? -300 : real;
-    };
-  } catch (_) {}
+
 
   // Auto-click interstitials on Amazon
   try {

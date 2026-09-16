@@ -27,20 +27,18 @@ function proxyToLine(p) {
 }
 
 async function load() {
-  const s = await chrome.storage.local.get(['sgBackend', 'sgProxies', 'sgProxyEnabled']);
-  document.querySelector(`input[name="backend"][value="${s.sgBackend || 'proxy'}"]`).checked = true;
+  const s = await chrome.storage.local.get(['sgProxies', 'sgProxyEnabled']);
   document.getElementById('enabled').checked = s.sgProxyEnabled !== false;
   const proxies = Array.isArray(s.sgProxies) ? s.sgProxies : [];
   document.getElementById('proxies').value = proxies.map(proxyToLine).join('\n');
 }
 
 async function save() {
-  const backend = document.querySelector('input[name="backend"]:checked').value;
   const enabled = document.getElementById('enabled').checked;
   const lines = document.getElementById('proxies').value.split('\n');
   const proxies = lines.map(parseProxyLine).filter(Boolean);
   const bad = lines.filter(l => l.trim() && !l.trim().startsWith('#')).length - proxies.length;
-  await chrome.storage.local.set({ sgBackend: backend, sgProxyEnabled: enabled, sgProxies: proxies, sgProxyIdx: 0 });
+  await chrome.storage.local.set({ sgBackend: 'proxy', sgProxyEnabled: enabled, sgProxies: proxies, sgProxyIdx: 0 });
   const st = document.getElementById('status');
   st.textContent = `Saved — ${proxies.length} proxy(ies)${bad > 0 ? `, ${bad} line(s) ignored` : ''}.`;
   setTimeout(() => (st.textContent = ''), 4000);
