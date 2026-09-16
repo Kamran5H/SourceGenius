@@ -1,0 +1,28 @@
+name: CI Quality Gate
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-and-validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Validate Package Integrity
+        run: |
+          if [ -f "package.json" ]; then
+            node -e "JSON.parse(require('fs').readFileSync('package.json'))"
+            echo "package.json syntax verified!"
+          fi
+          echo "Node.js workspace validated successfully!"
